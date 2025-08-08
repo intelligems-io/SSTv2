@@ -1,6 +1,6 @@
 {
   "$schema": "https://unpkg.com/@changesets/config@2.0.0/schema.json",
-  "changelog": ["@changesets/changelog-github", { "repo": "cdalton713/SSTv2" }],
+  "changelog": ["@changesets/changelog-github", { "repo": "intelligems-io/SSTv2" }],
   "commit": false,
   "fixed": [
     ["@intelligems/sst"]
@@ -10,5 +10,5 @@
   "baseBranch": "master",
   "updateInternalDependencies": "patch",
   "ignore": [],
-  "tag": "v2"
+  "tag": "ig"
 }

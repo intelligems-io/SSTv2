@@ -1024,18 +1024,18 @@ export class Function extends CDKFunction implements SSTConstruct {
           ? {
             code: Code.fromInline("export function placeholder() {}"),
             handler: "index.placeholder",
-            runtime: CDKRuntime.NODEJS_20_X,
+            runtime: CDKRuntime.NODEJS_22_X,
             layers: undefined,
           }
           : props.code ? {
             code: props.code,
             handler: "index.handler",
-            runtime: CDKRuntime.NODEJS_20_X,
+            runtime: CDKRuntime.NODEJS_22_X,
             layers: Function.buildLayers(scope, id, props),
           } : {
             code: Code.fromInline("export function placeholder() {}"),
             handler: "index.placeholder",
-            runtime: CDKRuntime.NODEJS_20_X,
+            runtime: CDKRuntime.NODEJS_22_X,
             layers: Function.buildLayers(scope, id, props),
           }),
         architecture,
