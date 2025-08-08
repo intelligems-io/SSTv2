@@ -16,7 +16,7 @@
     "prepare": "",
     "build": "node build.mjs && tsc",
     "test": "vitest run",
-    "dev": "tsc -w"
+    "dev": "source .env && tsc-watch --onSuccess \"rsync -av dist/* ${TO} --checksum\""
   },
   "repository": {
     "type": "git",
@@ -104,6 +104,7 @@
     "zod": "^3.21.4"
   },
   "devDependencies": {
+    "dotenv-cli": "^8.0.0",
     "@aws-sdk/client-api-gateway": "3.699.0",
     "@aws-sdk/client-cloudfront": "3.699.0",
     "@aws-sdk/client-codebuild": "3.699.0",
@@ -132,7 +133,8 @@
     "async": "^3.2.4",
     "tsx": "^3.12.1",
     "typescript": "5.2.2",
-    "vitest": "^0.33.0"
+    "vitest": "^0.33.0",
+    "tsc-watch": "^6.2.1"
   },
   "peerDependencies": {
     "@sls-next/lambda-at-edge": "^3.7.0"

@@ -78,7 +78,6 @@ const supportedRuntimes = {
   "python3.10": CDKRuntime.PYTHON_3_10,
   "python3.11": CDKRuntime.PYTHON_3_11,
   "python3.12": CDKRuntime.PYTHON_3_12,
-  "python3.13": CDKRuntime.PYTHON_3_13,
   "dotnetcore3.1": CDKRuntime.DOTNET_CORE_3_1,
   dotnet6: CDKRuntime.DOTNET_6,
   dotnet8: CDKRuntime.DOTNET_8,
@@ -142,6 +141,8 @@ export interface FunctionProps
     | "logRetention"
     | "ephemeralStorageSize"
   > {
+
+  code?: Code,
   /**
    * Used to configure additional files to copy into the function bundle
    *
@@ -899,12 +900,12 @@ export class Function extends CDKFunction implements SSTConstruct {
     const tracing =
       Tracing[
         (props.tracing || "active").toUpperCase() as keyof typeof Tracing
-      ];
+        ];
     const logRetention =
       props.logRetention &&
       RetentionDays[
         props.logRetention.toUpperCase() as keyof typeof RetentionDays
-      ];
+        ];
     const isLiveDevEnabled =
       app.mode === "dev" && (props.enableLiveDev === false ? false : true);
 
@@ -932,11 +933,11 @@ export class Function extends CDKFunction implements SSTConstruct {
         logRetentionRetryOptions: logRetention && { maxRetries: 100 },
       });
     }
-    // Handle local development (ie. sst start)
-    // - set runtime to nodejs for non-Node runtimes (b/c the stub is in Node)
-    // - set retry to 0. When the debugger is disconnected, the Cron construct
-    //   will still try to periodically invoke the Lambda, and the requests would
-    //   fail and retry. So when launching `sst start`, a couple of retry requests
+      // Handle local development (ie. sst start)
+      // - set runtime to nodejs for non-Node runtimes (b/c the stub is in Node)
+      // - set retry to 0. When the debugger is disconnected, the Cron construct
+      //   will still try to periodically invoke the Lambda, and the requests would
+      //   fail and retry. So when launching `sst start`, a couple of retry requests
     //   from recent failed request will be received. And this behavior is confusing.
     else if (isLiveDevEnabled) {
       // If debugIncreaseTimeout is enabled:
@@ -960,28 +961,28 @@ export class Function extends CDKFunction implements SSTConstruct {
         ...props,
         ...(props.runtime === "container"
           ? {
-              description,
-              code: Code.fromAssetImage(
-                path.resolve(__dirname, "../support/bridge"),
-                {
-                  ...(architecture?.dockerPlatform
-                    ? { platform: Platform.custom(architecture.dockerPlatform) }
-                    : {}),
-                }
-              ),
-              handler: CDKHandler.FROM_IMAGE,
-              runtime: CDKRuntime.FROM_IMAGE,
-              layers: undefined,
-            }
+            description,
+            code: Code.fromAssetImage(
+              path.resolve(__dirname, "../support/bridge"),
+              {
+                ...(architecture?.dockerPlatform
+                  ? { platform: Platform.custom(architecture.dockerPlatform) }
+                  : {}),
+              }
+            ),
+            handler: CDKHandler.FROM_IMAGE,
+            runtime: CDKRuntime.FROM_IMAGE,
+            layers: undefined,
+          }
           : {
-              description,
-              runtime: CDKRuntime.NODEJS_22_X,
-              code: Code.fromAsset(
-                path.resolve(__dirname, "../support/bridge")
-              ),
-              handler: "live-lambda.handler",
-              layers: [],
-            }),
+            description,
+            runtime: CDKRuntime.NODEJS_22_X,
+            code: Code.fromAsset(
+              path.resolve(__dirname, "../support/bridge")
+            ),
+            handler: "live-lambda.handler",
+            layers: [],
+          }),
         architecture,
         functionName,
         memorySize,
@@ -1021,17 +1022,22 @@ export class Function extends CDKFunction implements SSTConstruct {
         ...props,
         ...(props.runtime === "container"
           ? {
-              code: Code.fromInline("export function placeholder() {}"),
-              handler: "index.placeholder",
-              runtime: CDKRuntime.NODEJS_22_X,
-              layers: undefined,
-            }
-          : {
-              code: Code.fromInline("export function placeholder() {}"),
-              handler: "index.placeholder",
-              runtime: CDKRuntime.NODEJS_22_X,
-              layers: Function.buildLayers(scope, id, props),
-            }),
+            code: Code.fromInline("export function placeholder() {}"),
+            handler: "index.placeholder",
+            runtime: CDKRuntime.NODEJS_20_X,
+            layers: undefined,
+          }
+          : props.code ? {
+            code: props.code,
+            handler: "index.handler",
+            runtime: CDKRuntime.NODEJS_20_X,
+            layers: Function.buildLayers(scope, id, props),
+          } : {
+            code: Code.fromInline("export function placeholder() {}"),
+            handler: "index.placeholder",
+            runtime: CDKRuntime.NODEJS_20_X,
+            layers: Function.buildLayers(scope, id, props),
+          }),
         architecture,
         functionName,
         memorySize,
@@ -1049,19 +1055,29 @@ export class Function extends CDKFunction implements SSTConstruct {
             `➜  Building the container image for the "${this.node.id}" function...`
           );
 
-        // Build function
-        const result = await useRuntimeHandlers().build(
-          this.node.addr,
-          "deploy"
-        );
+        let result: { type: "error", errors: string[] } | {
+          out: string,
+          sourcemap: string | undefined,
+          type: "success",
+          handler: string,
+          errors?: undefined
+        } | null = null;
 
-        if (result.type === "error") {
-          throw new VisibleError(
-            [
-              `Failed to build function "${props.handler}"`,
-              ...result.errors,
-            ].join("\n")
+        if (!props.code) {
+          // Build function
+          result = await useRuntimeHandlers().build(
+            this.node.addr,
+            "deploy"
           );
+
+          if (result.type === "error") {
+            throw new VisibleError(
+              [
+                `Failed to build function "${props.handler}"`,
+                ...result.errors,
+              ].join("\n")
+            );
+          }
         }
 
         // Update function code for container
@@ -1100,31 +1116,37 @@ export class Function extends CDKFunction implements SSTConstruct {
         }
 
         // Update function code for non-container
-        if (result.sourcemap) {
-          const data = await fs.readFile(result.sourcemap);
-          await fs.writeFile(result.sourcemap, zlib.gzipSync(data));
-          const asset = new Asset(this, this.id + "-Sourcemap", {
-            path: result.sourcemap,
-          });
-          await fs.rm(result.sourcemap);
-          useFunctions().sourcemaps.add(stack.stackName, {
-            asset,
-            tarKey: this.functionArn,
-          });
+        if (result){
+          if (result.sourcemap) {
+            const data = await fs.readFile(result.sourcemap);
+            await fs.writeFile(result.sourcemap, zlib.gzipSync(data));
+            const asset = new Asset(this, this.id + "-Sourcemap", {
+              path: result.sourcemap,
+            });
+            await fs.rm(result.sourcemap);
+            useFunctions().sourcemaps.add(stack.stackName, {
+              asset,
+              tarKey: this.functionArn,
+            });
+          }
+          this.missingSourcemap = !result.sourcemap;
         }
-        this.missingSourcemap = !result.sourcemap;
 
         // Update code
-        const code = AssetCode.fromAsset(result.out);
-        const codeConfig = code.bind(this);
+        if (result) {
+          const code = AssetCode.fromAsset(result.out);
+          const codeConfig = code.bind(this);
 
-        cfnFunction.code = {
-          s3Bucket: codeConfig.s3Location?.bucketName,
-          s3Key: codeConfig.s3Location?.objectKey,
-          s3ObjectVersion: codeConfig.s3Location?.objectVersion,
-        };
-        cfnFunction.handler = result.handler;
-        code.bindToResource(cfnFunction);
+          cfnFunction.code = {
+            s3Bucket: codeConfig.s3Location?.bucketName,
+            s3Key: codeConfig.s3Location?.objectKey,
+            s3ObjectVersion: codeConfig.s3Location?.objectVersion,
+          };
+          cfnFunction.handler = result.handler;
+          code.bindToResource(cfnFunction);
+        } else {
+          cfnFunction.handler = 'index.mjs';
+        }
 
         // Update runtime
         // @ts-ignore - override "runtime" private property
@@ -1297,7 +1319,7 @@ export class Function extends CDKFunction implements SSTConstruct {
   }
 
   private createSecretPrefetcher() {
-    const { prefetchSecrets } = this.props;
+    const {prefetchSecrets} = this.props;
     if (!prefetchSecrets) return;
 
     const stack = Stack.of(this) as Stack;
@@ -1465,7 +1487,7 @@ export class Function extends CDKFunction implements SSTConstruct {
       if (inheritedProps && Object.keys(inheritedProps).length > 0) {
         throw new Error(
           inheritErrorMessage ||
-            `Cannot inherit default props when a Function is provided`
+          `Cannot inherit default props when a Function is provided`
         );
       }
       return definition;

@@ -1,9 +1,9 @@
 {
   "$schema": "https://unpkg.com/@changesets/config@2.0.0/schema.json",
-  "changelog": ["@changesets/changelog-github", { "repo": "sst/v2" }],
+  "changelog": ["@changesets/changelog-github", { "repo": "cdalton713/SSTv2" }],
   "commit": false,
   "fixed": [
-    ["@sst/console", "create-sst", "sst", "svelte-kit-sst", "solid-start-sst"]
+    ["@intelligems/sst"]
   ],
   "linked": [],
   "access": "public",
