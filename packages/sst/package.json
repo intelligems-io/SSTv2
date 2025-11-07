@@ -4,8 +4,8 @@
     "access": "public"
   },
   "sideEffects": false,
-  "name": "@intelligems/sst",
-  "version": "2.49.3-ig.1",
+  "name": "sst",
+  "version": "2.49.6",
   "bin": {
     "sst": "cli/sst.js"
   },
