@@ -24,6 +24,7 @@ declare module "../bus.js" {
     };
     "function.build.success": {
       functionID: string;
+      monoBundle?: boolean;
     };
     "function.build.failed": {
       functionID: string;
@@ -64,6 +65,7 @@ export interface RuntimeHandler {
         type: "success";
         handler: string;
         sourcemap?: string;
+        out?: string; // Optional: if provided, use this instead of artifacts path (for mono-bundle)
       }
     | {
         type: "error";
@@ -107,6 +109,29 @@ export const useRuntimeHandlers = lazy(() => {
           };
         const handler = result.for(func.runtime!);
         const out = path.join(project.paths.artifacts, functionID);
+
+        // Check for mono-bundle mode by doing a preliminary build call
+        // In mono-bundle mode, handler returns its own out path immediately without building
+        const monoBundleCheck = await handler!.build({
+          functionID,
+          out,
+          mode,
+          props: func,
+        });
+
+        // If mono-bundle detected (handler returned custom out), skip all artifact work
+        if (monoBundleCheck.type === "success" && monoBundleCheck.out) {
+          bus.publish("function.build.started", { functionID });
+          bus.publish("function.build.success", { functionID, monoBundle: true });
+          return {
+            type: "success" as const,
+            handler: monoBundleCheck.handler,
+            out: monoBundleCheck.out,
+            sourcemap: monoBundleCheck.sourcemap,
+          };
+        }
+
+        // Non-mono-bundle: follow original flow
         await fs.rm(out, { recursive: true, force: true });
         await fs.mkdir(out, { recursive: true });
 

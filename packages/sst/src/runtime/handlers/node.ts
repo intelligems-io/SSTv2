@@ -75,6 +75,40 @@ export const useNodeHandler = (): RuntimeHandler => {
       await worker?.terminate();
     },
     build: async (input) => {
+      // Check for dev mode mono-bundle: if .mono-build/index.mjs exists, skip individual builds
+      const monoBundleDir = path.join(project.paths.root, ".mono-build");
+      const monoBundlePath = path.join(monoBundleDir, "index.mjs");
+      const monoBundleExists = fsSync.existsSync(monoBundlePath);
+      console.log(`[MONO-BUNDLE] mode=${input.mode}, exists=${monoBundleExists}, handler=${input.props.handler}`);
+      if (input.mode === "start" && monoBundleExists) {
+        console.log(`[MONO-BUNDLE] Using mono-bundle for: ${input.props.handler}`);
+        Logger.debug("Using mono-bundle for dev mode:", monoBundlePath);
+
+        // Symlink node_modules to mono-bundle dir for external dependencies
+        // Use the same approach as individual builds: find nearest package.json above the handler
+        // handler-functions.ts lives in web/node-backend/src/, so start from there
+        const handlerFunctionsDir = path.join(project.paths.root, "web/node-backend/src");
+        const root = await findAbove(handlerFunctionsDir, "package.json");
+        if (root) {
+          const sourceNodeModules = path.join(root, "node_modules");
+          const monoBundleNodeModules = path.join(monoBundleDir, "node_modules");
+          try {
+            // Remove existing node_modules in mono-build (might be stale from deploy build)
+            await fs.rm(monoBundleNodeModules, { recursive: true, force: true });
+            await fs.symlink(path.resolve(sourceNodeModules), monoBundleNodeModules, "dir");
+            Logger.debug("Symlinked node_modules for mono-bundle from:", sourceNodeModules);
+          } catch (err) {
+            Logger.debug("Failed to symlink node_modules for mono-bundle:", err);
+          }
+        }
+
+        return {
+          type: "success" as const,
+          handler: "index.handler",
+          out: monoBundleDir,
+        };
+      }
+
       const parsed = path.parse(input.props.handler!);
       const file = [
         ".ts",
