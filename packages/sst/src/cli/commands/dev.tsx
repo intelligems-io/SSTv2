@@ -135,10 +135,11 @@ export const dev = (program: Program) =>
             const info = useFunctions().fromID(evt.properties.functionID);
             if (!info) return;
             if (info.enableLiveDev === false) return;
+            const buildType = evt.properties.monoBundle ? "(mono-bundle)" : "(individual)";
             Colors.line(
               info.runtime === "container"
-                ? Colors.dim(Colors.prefix, "Built", info.handler!, "container")
-                : Colors.dim(Colors.prefix, "Built", info.handler!)
+                ? Colors.dim(Colors.prefix, "Built", info.handler!, "container", buildType)
+                : Colors.dim(Colors.prefix, "Built", info.handler!, buildType)
             );
           });
 

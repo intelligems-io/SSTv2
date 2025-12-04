@@ -8,12 +8,31 @@ import { Context as LambdaContext } from "aws-lambda";
 // global.require = createRequire(import.meta.url);
 
 const input = workerData;
-const parsed = path.parse(input.handler);
-const file = [".js", ".jsx", ".mjs", ".cjs"]
-  .map((ext) => path.join(input.out, parsed.dir, parsed.name + ext))
-  .find((file) => {
-    return fs.existsSync(file);
-  })!;
+
+// Check for mono-bundle mode: if handler is "index.handler" and index.mjs exists in out directory
+const monoBundlePath = path.join(input.out, "index.mjs");
+const useMonoBundle = input.handler === "index.handler" && fs.existsSync(monoBundlePath);
+
+let file: string;
+let handlerName: string;
+
+if (useMonoBundle) {
+  // Mono-bundle mode: load from single bundled file
+  file = monoBundlePath;
+  handlerName = "handler"; // handler-functions.ts exports 'handler'
+} else {
+  // Individual handler mode (legacy)
+  const parsed = path.parse(input.handler);
+  const foundFile = [".js", ".jsx", ".mjs", ".cjs"]
+    .map((ext) => path.join(input.out, parsed.dir, parsed.name + ext))
+    .find((f) => fs.existsSync(f));
+
+  if (!foundFile) {
+    throw new Error(`Could not find handler file for "${input.handler}"`);
+  }
+  file = foundFile;
+  handlerName = parsed.ext.substring(1);
+}
 
 let fn: any;
 
@@ -59,13 +78,12 @@ function fetch(req: {
 try {
   const { href } = url.pathToFileURL(file);
   const mod = await import(href);
-  const handler = parsed.ext.substring(1);
-  fn = mod[handler];
+  fn = mod[handlerName];
   if (!fn) {
     throw new Error(
-      `Function "${handler}" not found in "${
-        input.handler
-      }". Found ${Object.keys(mod).join(", ")}`
+      useMonoBundle
+        ? `Mono-bundle handler "${handlerName}" not found in "${file}". Found: ${Object.keys(mod).join(", ")}`
+        : `Function "${handlerName}" not found in "${input.handler}". Found: ${Object.keys(mod).join(", ")}`
     );
   }
   // if (!mod) mod = require(file);
