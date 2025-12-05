@@ -214,7 +214,9 @@ interface Artifact {
 export const useFunctionBuilder = lazy(() => {
   const artifacts = new Map<string, Artifact>();
   const handlers = useRuntimeHandlers();
-  const semaphore = new Semaphore(4);
+  const semaphore = new Semaphore(
+    parseInt(process.env.SST_BUILD_CONCURRENCY || "4", 10)
+  );
 
   const result = {
     artifact: (functionID: string) => {
