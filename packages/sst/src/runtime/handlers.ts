@@ -1,21 +1,21 @@
-import { Logger } from "../logger.js";
+import {Logger} from "../logger.js";
 import path from "path";
 import zlib from "zlib";
 import fs from "fs/promises";
-import { useWatcher } from "../watcher.js";
-import { useBus } from "../bus.js";
+import {useWatcher} from "../watcher.js";
+import {useBus} from "../bus.js";
 import crypto from "crypto";
-import { useProject } from "../project.js";
-import { FunctionProps, useFunctions } from "../constructs/Function.js";
-import { useNodeHandler } from "./handlers/node.js";
-import { useContainerHandler } from "./handlers/container.js";
-import { useDotnetHandler } from "./handlers/dotnet.js";
-import { useGoHandler } from "./handlers/go.js";
-import { useJavaHandler } from "./handlers/java.js";
-import { usePythonHandler } from "./handlers/python.js";
-import { useRustHandler } from "./handlers/rust.js";
-import { lazy } from "../util/lazy.js";
-import { Semaphore } from "../util/semaphore.js";
+import {useProject} from "../project.js";
+import {FunctionProps, useFunctions} from "../constructs/Function.js";
+import {useNodeHandler} from "./handlers/node.js";
+import {useContainerHandler} from "./handlers/container.js";
+import {useDotnetHandler} from "./handlers/dotnet.js";
+import {useGoHandler} from "./handlers/go.js";
+import {useJavaHandler} from "./handlers/java.js";
+import {usePythonHandler} from "./handlers/python.js";
+import {useRustHandler} from "./handlers/rust.js";
+import {lazy} from "../util/lazy.js";
+import {Semaphore} from "../util/semaphore.js";
 
 declare module "../bus.js" {
   export interface Events {
@@ -62,15 +62,15 @@ export interface RuntimeHandler {
   canHandle: (runtime: string) => boolean;
   build: (input: BuildInput) => Promise<
     | {
-        type: "success";
-        handler: string;
-        sourcemap?: string;
-        out?: string; // Optional: if provided, use this instead of artifacts path (for mono-bundle)
-      }
+    type: "success";
+    handler: string;
+    sourcemap?: string;
+    out?: string; // Optional: if provided, use this instead of artifacts path (for mono-bundle)
+  }
     | {
-        type: "error";
-        errors: string[];
-      }
+    type: "error";
+    errors: string[];
+  }
   >;
 }
 
@@ -120,9 +120,9 @@ export const useRuntimeHandlers = lazy(() => {
         });
 
         // If mono-bundle detected (handler returned custom out), skip all artifact work
+        // Don't fire build events - mono-bundle is built externally by esbuild watch
+        // Worker pool invalidation is handled separately when bundle file actually changes
         if (monoBundleCheck.type === "success" && monoBundleCheck.out) {
-          bus.publish("function.build.started", { functionID });
-          bus.publish("function.build.success", { functionID, monoBundle: true });
           return {
             type: "success" as const,
             handler: monoBundleCheck.handler,
@@ -132,10 +132,10 @@ export const useRuntimeHandlers = lazy(() => {
         }
 
         // Non-mono-bundle: follow original flow
-        await fs.rm(out, { recursive: true, force: true });
-        await fs.mkdir(out, { recursive: true });
+        await fs.rm(out, {recursive: true, force: true});
+        await fs.mkdir(out, {recursive: true});
 
-        bus.publish("function.build.started", { functionID });
+        bus.publish("function.build.started", {functionID});
 
         if (func.hooks?.beforeBuild) await func.hooks.beforeBuild(func, out);
         const built = await handler!.build({
@@ -168,7 +168,7 @@ export const useRuntimeHandlers = lazy(() => {
               if (mode === "start") {
                 try {
                   const dir = path.dirname(toPath);
-                  await fs.mkdir(dir, { recursive: true });
+                  await fs.mkdir(dir, {recursive: true});
                   await fs.symlink(fromPath, toPath);
                 } catch (ex) {
                   Logger.debug("Failed to symlink", fromPath, toPath, ex);
@@ -180,7 +180,7 @@ export const useRuntimeHandlers = lazy(() => {
 
         if (func.hooks?.afterBuild) await func.hooks.afterBuild(func, out);
 
-        bus.publish("function.build.success", { functionID });
+        bus.publish("function.build.success", {functionID});
         return {
           ...built,
           out,
@@ -214,7 +214,9 @@ interface Artifact {
 export const useFunctionBuilder = lazy(() => {
   const artifacts = new Map<string, Artifact>();
   const handlers = useRuntimeHandlers();
-  const semaphore = new Semaphore(4);
+  const semaphore = new Semaphore(
+    parseInt(process.env.SST_BUILD_CONCURRENCY || "4", 10)
+  );
 
   const result = {
     artifact: (functionID: string) => {
@@ -240,6 +242,11 @@ export const useFunctionBuilder = lazy(() => {
     try {
       const functions = useFunctions();
       for (const [functionID, info] of Object.entries(functions.all)) {
+        // Optimization: For mono-build, the artifact path is stable and build is handled externally.
+        // We can skip the potentially expensive shouldBuild check and rebuild call.
+        const existing = artifacts.get(functionID);
+        if (existing?.out.includes(".mono-build")) continue;
+
         const handler = handlers.for(info.runtime!);
         if (
           !handler?.shouldBuild({
@@ -251,7 +258,8 @@ export const useFunctionBuilder = lazy(() => {
         await result.build(functionID);
         Logger.debug("Rebuilt function", functionID);
       }
-    } catch {}
+    } catch {
+    }
   });
 
   return result;

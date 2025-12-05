@@ -62,10 +62,21 @@ const device = new iot.device({
   host: endpoint,
   region: ENVIRONMENT.AWS_REGION,
 });
+let isConnected = false;
+device.on("connect", () => {
+  console.log("IoT connected");
+  isConnected = true;
+});
+device.on("offline", () => {
+  console.log("IoT offline");
+  isConnected = false;
+});
 device.on("error", console.log);
-device.on("connect", console.log);
-device.subscribe(`${PREFIX}/events/${workerID}`, {
-  qos: 1,
+const subscription = new Promise<void>((resolve, reject) => {
+  device.subscribe(`${PREFIX}/events/${workerID}`, { qos: 1 }, (err) => {
+    if (err) reject(err);
+    else resolve();
+});
 });
 
 interface Fragment {
@@ -121,6 +132,13 @@ device.on("message", async (_topic, buffer: Buffer) => {
 });
 
 export async function handler(event: any, context: any) {
+  if (!isConnected) {
+    console.log("Waiting for IoT connection...");
+    await new Promise<void>((resolve) => {
+      device.once("connect", () => resolve());
+    });
+  }
+
   const result = await new Promise<any>((r) => {
     const timeout = setTimeout(() => {
       r({

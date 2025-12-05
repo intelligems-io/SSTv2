@@ -39,27 +39,34 @@ export const useRuntimeServer = lazy(async () => {
     });
   }
 
+  // Route an invocation to a specific workerID (used by workers.ts for pooled workers)
+  function routeInvocation(
+    targetWorkerID: string,
+    invocation: Events["function.invoked"]
+  ) {
+    const waiting = workersWaiting.get(targetWorkerID);
+    if (waiting) {
+      workersWaiting.delete(targetWorkerID);
+      waiting(invocation);
+      return;
+    }
+
+    let arr = invocationsQueued.get(targetWorkerID);
+    if (!arr) {
+      arr = [];
+      invocationsQueued.set(targetWorkerID, arr);
+    }
+    arr.push(invocation);
+  }
+
   workers.subscribe("worker.exited", async (evt) => {
     const waiting = workersWaiting.get(evt.properties.workerID);
     if (!waiting) return;
     workersWaiting.delete(evt.properties.workerID);
   });
 
-  bus.subscribe("function.invoked", async (evt) => {
-    const worker = workersWaiting.get(evt.properties.workerID);
-    if (worker) {
-      workersWaiting.delete(evt.properties.workerID);
-      worker(evt.properties);
-      return;
-    }
-
-    let arr = invocationsQueued.get(evt.properties.workerID);
-    if (!arr) {
-      arr = [];
-      invocationsQueued.set(evt.properties.workerID, arr);
-    }
-    arr.push(evt.properties);
-  });
+  // Note: function.invoked routing is handled by workers.ts via routeInvocation()
+  // This ensures correct routing for both pooled and non-pooled workers
 
   app.post<{ functionID: string; workerID: string }>(
     `/:workerID/${cfg.API_VERSION}/runtime/init/error`,
@@ -69,13 +76,27 @@ export const useRuntimeServer = lazy(async () => {
       limit: "10mb",
     }),
     async (req, res) => {
-      const worker = workers.fromID(req.params.workerID);
+      const pooledWorkerID = req.params.workerID;
+      const worker = workers.fromID(pooledWorkerID);
+      if (!worker) {
+        res.status(404).send();
+        return;
+      }
+
+      // Get AWS workerID for IoT routing (if pooled)
+      const awsWorkerID = workers.isPooled(pooledWorkerID)
+        ? workers.getAwsWorkerID(pooledWorkerID) || pooledWorkerID
+        : pooledWorkerID;
+
       bus.publish("function.error", {
-        requestID: workers.getCurrentRequestID(worker.workerID),
-        workerID: worker.workerID,
+        requestID: workers.getCurrentRequestID(pooledWorkerID),
+        workerID: awsWorkerID,
         functionID: worker.functionID,
         ...req.body,
       });
+
+      // Return pooled worker to pool
+      workers.onResponse(pooledWorkerID);
 
       res.json("ok");
     }
@@ -104,8 +125,15 @@ export const useRuntimeServer = lazy(async () => {
         ),
         "Lambda-Runtime-Log-Group-Name": payload.context.logGroupName,
         "Lambda-Runtime-Log-Stream-Name": payload.context.logStreamName,
+        // Pass function ID for mono-build shared pool: allows per-invocation dispatch
+        "Lambda-Runtime-Sst-Function-Id": payload.functionID,
       });
-      res.json(payload.event);
+      // Wrap event with env for per-invocation environment variable application
+      // This prevents env leakage when workers are reused across different functions
+      res.json({
+        event: payload.event,
+        env: payload.env,
+      });
     }
   );
 
@@ -122,14 +150,30 @@ export const useRuntimeServer = lazy(async () => {
       limit: "10mb",
     }),
     (req, res) => {
-      Logger.debug("Worker", req.params.workerID, "got response", req.body);
-      const worker = workers.fromID(req.params.workerID)!;
+      const pooledWorkerID = req.params.workerID;
+      Logger.debug("Worker", pooledWorkerID, "got response", req.body);
+
+      const worker = workers.fromID(pooledWorkerID);
+      if (!worker) {
+        res.status(404).send();
+        return;
+      }
+
+      // Get AWS workerID for IoT routing (if pooled)
+      const awsWorkerID = workers.isPooled(pooledWorkerID)
+        ? workers.getAwsWorkerID(pooledWorkerID) || pooledWorkerID
+        : pooledWorkerID;
+
       bus.publish("function.success", {
-        workerID: worker.workerID,
+        workerID: awsWorkerID,
         functionID: worker.functionID,
         requestID: req.params.awsRequestId,
         body: req.body,
       });
+
+      // Return pooled worker to pool
+      workers.onResponse(pooledWorkerID);
+
       res.status(202).send();
     }
   );
@@ -197,18 +241,37 @@ export const useRuntimeServer = lazy(async () => {
       limit: "10mb",
     }),
     (req, res) => {
-      const worker = workers.fromID(req.params.workerID)!;
+      const pooledWorkerID = req.params.workerID;
+      const worker = workers.fromID(pooledWorkerID);
+      if (!worker) {
+        res.status(404).send();
+        return;
+      }
+
+      // Get AWS workerID for IoT routing (if pooled)
+      const awsWorkerID = workers.isPooled(pooledWorkerID)
+        ? workers.getAwsWorkerID(pooledWorkerID) || pooledWorkerID
+        : pooledWorkerID;
+
       bus.publish("function.error", {
-        workerID: worker.workerID,
+        workerID: awsWorkerID,
         functionID: worker.functionID,
         errorType: req.body.errorType,
         errorMessage: req.body.errorMessage,
         requestID: req.params.awsRequestId,
         trace: req.body.trace,
       });
+
+      // Return pooled worker to pool
+      workers.onResponse(pooledWorkerID);
+
       res.status(202).send();
     }
   );
 
   app.listen(cfg.port);
+
+  return {
+    routeInvocation,
+  };
 });
