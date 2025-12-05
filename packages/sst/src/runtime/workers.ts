@@ -56,12 +56,14 @@ const IDLE_TIMEOUT = parseInt(
 
 // Runtimes that support multiple invocations per process (have event loop)
 const POOLABLE_RUNTIMES = new Set([
+  // Node.js - has while(true) loop in nodejs-runtime/index.ts
   "nodejs",
   "nodejs14.x",
   "nodejs16.x",
   "nodejs18.x",
   "nodejs20.x",
   "nodejs22.x",
+  // Python - has while True loop in python-runtime/runtime.py
   "python",
   "python3.7",
   "python3.8",
@@ -70,6 +72,23 @@ const POOLABLE_RUNTIMES = new Set([
   "python3.11",
   "python3.12",
   "python3.13",
+  // Go - AWS Lambda Go SDK has built-in event loop
+  "go",
+  "go1.x",
+  // Java - AWS Lambda Java SDK has built-in event loop
+  "java",
+  "java8",
+  "java8.al2",
+  "java11",
+  "java17",
+  "java21",
+  // .NET - AWS Lambda .NET SDK has built-in event loop
+  "dotnet",
+  "dotnet6",
+  "dotnet8",
+  "dotnetcore3.1",
+  // Rust - AWS Lambda Rust runtime has built-in event loop
+  "rust",
 ]);
 
 function isPoolableRuntime(
