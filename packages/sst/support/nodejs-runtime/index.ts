@@ -135,6 +135,13 @@ while (true) {
       method: "GET",
       headers: {},
     });
+
+    // For mono-build shared pool: set function ID per-invocation for dynamic dispatch
+    const sstFunctionId = result.headers["lambda-runtime-sst-function-id"];
+    if (sstFunctionId) {
+      process.env.SST_FUNCTION_ID = sstFunctionId;
+    }
+
     context = {
       awsRequestId: result.headers["lambda-runtime-aws-request-id"],
       invokedFunctionArn: result.headers["lambda-runtime-invoked-function-arn"],
