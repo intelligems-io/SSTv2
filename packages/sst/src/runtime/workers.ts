@@ -62,6 +62,14 @@ const POOLABLE_RUNTIMES = new Set([
   "nodejs18.x",
   "nodejs20.x",
   "nodejs22.x",
+  "python",
+  "python3.7",
+  "python3.8",
+  "python3.9",
+  "python3.10",
+  "python3.11",
+  "python3.12",
+  "python3.13",
 ]);
 
 function isPoolableRuntime(
