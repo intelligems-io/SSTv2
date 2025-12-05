@@ -43,32 +43,30 @@ export const useNodeHandler = (): RuntimeHandler => {
     canHandle: (input) => input.startsWith("nodejs"),
     startWorker: async (input) => {
       const workers = await useRuntimeWorkers();
-      new Promise(async () => {
-        const worker = new Worker(
-          url.fileURLToPath(
-            new URL("../../support/nodejs-runtime/index.mjs", import.meta.url)
-          ),
-          {
-            env: {
-              ...input.environment,
-              IS_LOCAL: "true",
-            },
-            execArgv: ["--enable-source-maps"],
-            workerData: input,
-            stderr: true,
-            stdin: true,
-            stdout: true,
-          }
-        );
-        worker.stdout.on("data", (data: Buffer) => {
-          workers.stdout(input.workerID, data.toString());
-        });
-        worker.stderr.on("data", (data: Buffer) => {
-          workers.stdout(input.workerID, data.toString());
-        });
-        worker.on("exit", () => workers.exited(input.workerID));
-        threads.set(input.workerID, worker);
+      const worker = new Worker(
+        url.fileURLToPath(
+          new URL("../../support/nodejs-runtime/index.mjs", import.meta.url)
+        ),
+        {
+          env: {
+            ...input.environment,
+            IS_LOCAL: "true",
+          },
+          execArgv: ["--enable-source-maps"],
+          workerData: input,
+          stderr: true,
+          stdin: true,
+          stdout: true,
+        }
+      );
+      worker.stdout.on("data", (data: Buffer) => {
+        workers.stdout(input.workerID, data.toString());
       });
+      worker.stderr.on("data", (data: Buffer) => {
+        workers.stdout(input.workerID, data.toString());
+      });
+      worker.on("exit", () => workers.exited(input.workerID));
+      threads.set(input.workerID, worker);
     },
     stopWorker: async (workerID) => {
       const worker = threads.get(workerID);
@@ -88,7 +86,8 @@ export const useNodeHandler = (): RuntimeHandler => {
 
         // Symlink node_modules to mono-bundle dir for external dependencies
         // Only create if symlink doesn't exist or points to wrong location (avoid redundant I/O)
-        const handlerFunctionsDir = path.join(project.paths.root, "web/node-backend/src");
+        const parsed = path.parse(input.props.handler!);
+        const handlerFunctionsDir = path.join(project.paths.root, parsed.dir);
         const root = await findAbove(handlerFunctionsDir, "package.json");
         if (root) {
           const sourceNodeModules = path.resolve(root, "node_modules");

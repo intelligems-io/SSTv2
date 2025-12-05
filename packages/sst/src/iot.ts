@@ -180,20 +180,17 @@ export const useIOT = lazy(async () => {
         properties,
         sourceID: bus.sourceID,
       };
-      for (const fragment of await encode(payload)) {
-        await new Promise<void>((r) => {
-          device.publish(
-            topic,
-            JSON.stringify(fragment),
-            {
-              qos: 1,
-            },
-            () => {
-              r();
-            }
-          );
-        });
-      }
+      const fragments = await encode(payload);
+      await Promise.all(
+        fragments.map(
+          (fragment) =>
+            new Promise<void>((r) => {
+              device.publish(topic, JSON.stringify(fragment), { qos: 1 }, () => {
+                r();
+              });
+            })
+        )
+      );
       Logger.debug("IOT Published", topic, type);
     },
   };

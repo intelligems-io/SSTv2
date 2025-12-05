@@ -135,6 +135,21 @@ while (true) {
       method: "GET",
       headers: {},
     });
+
+    // For mono-build shared pool: set function ID per-invocation for dynamic dispatch
+    const sstFunctionId = result.headers["lambda-runtime-sst-function-id"];
+    if (sstFunctionId) {
+      process.env.SST_FUNCTION_ID = sstFunctionId;
+    }
+
+    // Parse wrapped response: { event, env }
+    // Apply per-invocation env vars to prevent leakage when workers are reused
+    const parsed = JSON.parse(result.body);
+    const invocationEnv = parsed.env;
+    if (invocationEnv && typeof invocationEnv === "object") {
+      Object.assign(process.env, invocationEnv);
+    }
+
     context = {
       awsRequestId: result.headers["lambda-runtime-aws-request-id"],
       invokedFunctionArn: result.headers["lambda-runtime-invoked-function-arn"],
@@ -182,7 +197,7 @@ while (true) {
         );
       },
     };
-    request = JSON.parse(result.body);
+    request = parsed.event;
   } catch {
     continue;
   }

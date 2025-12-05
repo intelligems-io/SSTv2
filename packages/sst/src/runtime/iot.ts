@@ -1,6 +1,7 @@
 import { useBus } from "../bus.js";
 import { useIOT } from "../iot.js";
 import { lazy } from "../util/lazy.js";
+import { logInvokeTrace } from "./worker-pool-logging.js";
 
 export const useIOTBridge = lazy(async () => {
   const bus = useBus();
@@ -22,10 +23,13 @@ export const useIOTBridge = lazy(async () => {
     );
   });
   bus.subscribe("function.ack", async (evt) => {
-    iot.publish(
-      topic + "/" + evt.properties.workerID,
+    const workerID = evt.properties.workerID;
+    logInvokeTrace("IOT_ACK_START", workerID, `worker=${workerID.slice(0, 8)}`);
+    await iot.publish(
+      topic + "/" + workerID,
       "function.ack",
       evt.properties
     );
+    logInvokeTrace("IOT_ACK_DONE", workerID, `worker=${workerID.slice(0, 8)}`);
   });
 });
