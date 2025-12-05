@@ -1,18 +1,18 @@
 import os from "os";
 import path from "path";
 import fs from "fs/promises";
-import { exec } from "child_process";
+import {exec} from "child_process";
 import fsSync from "fs";
-import { useProject } from "../../project.js";
-import esbuild, { BuildOptions, BuildResult } from "esbuild";
+import {useProject} from "../../project.js";
+import esbuild, {BuildOptions, BuildResult} from "esbuild";
 import url from "url";
-import { Worker } from "worker_threads";
-import { RuntimeHandler } from "../handlers.js";
-import { useRuntimeWorkers } from "../workers.js";
-import { Colors } from "../../cli/colors.js";
-import { Logger } from "../../logger.js";
-import { findAbove, findBelow } from "../../util/fs.js";
-import { lazy } from "../../util/lazy.js";
+import {Worker} from "worker_threads";
+import {RuntimeHandler} from "../handlers.js";
+import {useRuntimeWorkers} from "../workers.js";
+import {Colors} from "../../cli/colors.js";
+import {Logger} from "../../logger.js";
+import {findAbove, findBelow} from "../../util/fs.js";
+import {lazy} from "../../util/lazy.js";
 
 export const useNodeHandler = (): RuntimeHandler => {
   const rebuildCache: Record<
@@ -23,7 +23,7 @@ export const useNodeHandler = (): RuntimeHandler => {
     }
   > = {};
   process.on("exit", () => {
-    for (const { ctx } of Object.values(rebuildCache)) {
+    for (const {ctx} of Object.values(rebuildCache)) {
       ctx.dispose();
     }
   });
@@ -79,26 +79,38 @@ export const useNodeHandler = (): RuntimeHandler => {
       const monoBundleDir = path.join(project.paths.root, ".mono-build");
       const monoBundlePath = path.join(monoBundleDir, "index.mjs");
       const monoBundleExists = fsSync.existsSync(monoBundlePath);
-      console.log(`[MONO-BUNDLE] mode=${input.mode}, exists=${monoBundleExists}, handler=${input.props.handler}`);
       if (input.mode === "start" && monoBundleExists) {
-        console.log(`[MONO-BUNDLE] Using mono-bundle for: ${input.props.handler}`);
-        Logger.debug("Using mono-bundle for dev mode:", monoBundlePath);
+        Colors.line(
+          Colors.prefix,
+          Colors.dim.bold("MonoBundle"),
+          Colors.dim(`mode=${input.mode}, exists=${monoBundleExists}, handler=${input.props.handler}`)
+        );
 
         // Symlink node_modules to mono-bundle dir for external dependencies
-        // Use the same approach as individual builds: find nearest package.json above the handler
-        // handler-functions.ts lives in web/node-backend/src/, so start from there
+        // Only create if symlink doesn't exist or points to wrong location (avoid redundant I/O)
         const handlerFunctionsDir = path.join(project.paths.root, "web/node-backend/src");
         const root = await findAbove(handlerFunctionsDir, "package.json");
         if (root) {
-          const sourceNodeModules = path.join(root, "node_modules");
+          const sourceNodeModules = path.resolve(root, "node_modules");
           const monoBundleNodeModules = path.join(monoBundleDir, "node_modules");
           try {
-            // Remove existing node_modules in mono-build (might be stale from deploy build)
-            await fs.rm(monoBundleNodeModules, { recursive: true, force: true });
-            await fs.symlink(path.resolve(sourceNodeModules), monoBundleNodeModules, "dir");
-            Logger.debug("Symlinked node_modules for mono-bundle from:", sourceNodeModules);
-          } catch (err) {
-            Logger.debug("Failed to symlink node_modules for mono-bundle:", err);
+            const existingTarget = await fs.readlink(monoBundleNodeModules);
+            if (existingTarget === sourceNodeModules) {
+              // Symlink already correct, skip
+            } else {
+              // Symlink points to wrong location, recreate
+              await fs.rm(monoBundleNodeModules, {recursive: true, force: true});
+              await fs.symlink(sourceNodeModules, monoBundleNodeModules, "dir");
+              Logger.debug("Symlinked node_modules for mono-bundle from:", sourceNodeModules);
+            }
+          } catch {
+            // Symlink doesn't exist, create it
+            try {
+              await fs.symlink(sourceNodeModules, monoBundleNodeModules, "dir");
+              Logger.debug("Symlinked node_modules for mono-bundle from:", sourceNodeModules);
+            } catch (err) {
+              Logger.debug("Failed to symlink node_modules for mono-bundle:", err);
+            }
           }
         }
 
@@ -169,7 +181,8 @@ export const useNodeHandler = (): RuntimeHandler => {
             path.resolve(path.join(input.out, "node_modules")),
             "dir"
           );
-        } catch {}
+        } catch {
+        }
       }
 
       // Rebuilt using existing esbuild context
@@ -179,7 +192,7 @@ export const useNodeHandler = (): RuntimeHandler => {
         "pg-native",
         ...(isESM || input.props.runtime !== "nodejs16.x" ? [] : ["aws-sdk"]),
       ];
-      const { external, ...override } = nodejs.esbuild || {};
+      const {external, ...override} = nodejs.esbuild || {};
       if (!ctx) {
         const options: BuildOptions = {
           entryPoints: [file],
@@ -195,31 +208,31 @@ export const useNodeHandler = (): RuntimeHandler => {
           logLevel: "silent",
           splitting: nodejs.splitting,
           metafile: true,
-          outExtension: nodejs.splitting ? { ".js": ".mjs" } : undefined,
+          outExtension: nodejs.splitting ? {".js": ".mjs"} : undefined,
           ...(isESM
             ? {
-                format: "esm",
-                target: "esnext",
-                mainFields: ["module", "main"],
-                banner: {
-                  js: [
-                    `import { createRequire as topLevelCreateRequire } from 'module';`,
-                    `const require = topLevelCreateRequire(import.meta.url);`,
-                    `import { fileURLToPath as topLevelFileUrlToPath, URL as topLevelURL } from "url"`,
-                    `const __dirname = topLevelFileUrlToPath(new topLevelURL(".", import.meta.url))`,
-                    nodejs.banner || "",
-                  ].join("\n"),
-                },
-              }
+              format: "esm",
+              target: "esnext",
+              mainFields: ["module", "main"],
+              banner: {
+                js: [
+                  `import { createRequire as topLevelCreateRequire } from 'module';`,
+                  `const require = topLevelCreateRequire(import.meta.url);`,
+                  `import { fileURLToPath as topLevelFileUrlToPath, URL as topLevelURL } from "url"`,
+                  `const __dirname = topLevelFileUrlToPath(new topLevelURL(".", import.meta.url))`,
+                  nodejs.banner || "",
+                ].join("\n"),
+              },
+            }
             : {
-                format: "cjs",
-                target: "node14",
-                banner: nodejs.banner
-                  ? {
-                      js: nodejs.banner,
-                    }
-                  : undefined,
-              }),
+              format: "cjs",
+              target: "node14",
+              banner: nodejs.banner
+                ? {
+                  js: nodejs.banner,
+                }
+                : undefined,
+            }),
           outfile: !nodejs.splitting ? target : undefined,
           outdir: nodejs.splitting ? path.dirname(target) : undefined,
           // always generate sourcemaps in local
@@ -229,8 +242,8 @@ export const useNodeHandler = (): RuntimeHandler => {
             input.mode === "start"
               ? "linked"
               : nodejs.sourcemap === false
-              ? false
-              : true,
+                ? false
+                : true,
           minify: nodejs.minify,
           ...override,
         };
@@ -247,8 +260,8 @@ export const useNodeHandler = (): RuntimeHandler => {
             .filter((pkg) => pkg !== "aws-sdk")
             .filter((pkg) => !external?.includes(pkg))
             .filter((pkg) =>
-              Object.values(result.metafile?.inputs || {}).some(({ imports }) =>
-                imports.some(({ path }) => path === pkg)
+              Object.values(result.metafile?.inputs || {}).some(({imports}) =>
+                imports.some(({path}) => path === pkg)
               )
             ),
         ];
@@ -256,10 +269,10 @@ export const useNodeHandler = (): RuntimeHandler => {
         // TODO bubble up the warnings
         const warnings: string[] = [];
         Object.entries(result.metafile?.inputs || {}).forEach(
-          ([inputPath, { imports }]) =>
+          ([inputPath, {imports}]) =>
             imports
-              .filter(({ path }) => path.includes("sst/constructs"))
-              .forEach(({ path }) => {
+              .filter(({path}) => path.includes("sst/constructs"))
+              .forEach(({path}) => {
                 warnings.push(
                   `You are importing from "${path}" in "${inputPath}". Did you mean to import from "sst/node"?`
                 );
@@ -320,7 +333,7 @@ export const useNodeHandler = (): RuntimeHandler => {
             // );
           }
           await new Promise<void>((resolve, reject) => {
-            exec(cmd.join(" "), { cwd: input.out }, (error) => {
+            exec(cmd.join(" "), {cwd: input.out}, (error) => {
               if (error) {
                 reject(error);
               }
@@ -331,7 +344,7 @@ export const useNodeHandler = (): RuntimeHandler => {
 
         // Cache esbuild result and context for rebuild
         if (input.mode === "start") {
-          rebuildCache[input.functionID] = { ctx, result };
+          rebuildCache[input.functionID] = {ctx, result};
         }
 
         if (input.mode === "deploy") {
@@ -345,8 +358,8 @@ export const useNodeHandler = (): RuntimeHandler => {
           handler,
           sourcemap: !nodejs.sourcemap
             ? Object.keys(result.metafile?.outputs || {}).find((item) =>
-                item.endsWith(".map")
-              )
+              item.endsWith(".map")
+            )
             : undefined,
         };
       } catch (ex: any) {
