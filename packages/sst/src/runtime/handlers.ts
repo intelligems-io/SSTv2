@@ -214,8 +214,9 @@ interface Artifact {
 export const useFunctionBuilder = lazy(() => {
   const artifacts = new Map<string, Artifact>();
   const handlers = useRuntimeHandlers();
+  // Default tuned for M1+ MacBooks (8-10 cores)
   const semaphore = new Semaphore(
-    parseInt(process.env.SST_BUILD_CONCURRENCY || "4", 10)
+    parseInt(process.env.SST_BUILD_CONCURRENCY || "8", 10)
   );
 
   const result = {

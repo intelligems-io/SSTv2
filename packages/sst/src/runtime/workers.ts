@@ -47,10 +47,10 @@ interface PooledWorker {
   createdAt: number;
 }
 
-// Configuration
-const POOL_SIZE = parseInt(process.env.SST_WORKER_POOL_SIZE || "5", 10);
+// Configuration - defaults tuned for M1+ MacBooks with 32GB+ RAM
+const POOL_SIZE = parseInt(process.env.SST_WORKER_POOL_SIZE || "10", 10);
 const IDLE_TIMEOUT = parseInt(
-  process.env.SST_WORKER_IDLE_TIMEOUT || "30000",
+  process.env.SST_WORKER_IDLE_TIMEOUT || "60000",
   10
 );
 
