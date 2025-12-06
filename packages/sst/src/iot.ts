@@ -3,6 +3,7 @@ import { useAWSClient, useAWSCredentials } from "./credentials.js";
 import { VisibleError } from "./error.js";
 import { lazy } from "./util/lazy.js";
 import { Logger } from "./logger.js";
+import { logIotRx } from "./runtime/debug-bridge-logging.js";
 
 export const useIOTEndpoint = lazy(async () => {
   const iot = useAWSClient(IoTClient);
@@ -145,6 +146,8 @@ export const useIOT = lazy(async () => {
   device.on("message", (_topic, buffer: Buffer) => {
     const fragment = JSON.parse(buffer.toString());
     if (!fragment.id) {
+      const requestID = fragment.properties?.requestID;
+      logIotRx(`Received ${fragment.type} reqId=${requestID?.slice(0, 8) || 'N/A'}`);
       bus.publish(fragment.type, fragment.properties);
       return;
     }
@@ -164,6 +167,8 @@ export const useIOT = lazy(async () => {
       fragments.delete(fragment.id);
       const evt = JSON.parse(data) as EventPayload;
       if (evt.sourceID === bus.sourceID) return;
+      const requestID = (evt.properties as any)?.requestID;
+      logIotRx(`Received ${evt.type} reqId=${requestID?.slice(0, 8) || 'N/A'} (${fragment.count} fragments)`);
       bus.publish(evt.type, evt.properties);
     }
   });
@@ -180,20 +185,17 @@ export const useIOT = lazy(async () => {
         properties,
         sourceID: bus.sourceID,
       };
-      for (const fragment of await encode(payload)) {
-        await new Promise<void>((r) => {
-          device.publish(
-            topic,
-            JSON.stringify(fragment),
-            {
-              qos: 1,
-            },
-            () => {
-              r();
-            }
-          );
-        });
-      }
+      const fragments = await encode(payload);
+      await Promise.all(
+        fragments.map(
+          (fragment) =>
+            new Promise<void>((r) => {
+              device.publish(topic, JSON.stringify(fragment), { qos: 1 }, () => {
+                r();
+              });
+            })
+        )
+      );
       Logger.debug("IOT Published", topic, type);
     },
   };

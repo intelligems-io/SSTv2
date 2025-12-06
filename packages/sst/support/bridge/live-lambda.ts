@@ -1,4 +1,4 @@
-import iot from "aws-iot-device-sdk";
+ import iot from "aws-iot-device-sdk";
 import crypto from "crypto";
 import { IoTClient, DescribeEndpointCommand } from "@aws-sdk/client-iot";
 import {
@@ -62,10 +62,21 @@ const device = new iot.device({
   host: endpoint,
   region: ENVIRONMENT.AWS_REGION,
 });
+let isConnected = false;
+device.on("connect", () => {
+  console.log("IoT connected");
+  isConnected = true;
+});
+device.on("offline", () => {
+  console.log("IoT offline");
+  isConnected = false;
+});
 device.on("error", console.log);
-device.on("connect", console.log);
-device.subscribe(`${PREFIX}/events/${workerID}`, {
-  qos: 1,
+const subscription = new Promise<void>((resolve, reject) => {
+  device.subscribe(`${PREFIX}/events/${workerID}`, { qos: 1 }, (err) => {
+    if (err) reject(err);
+    else resolve();
+});
 });
 
 interface Fragment {
@@ -77,7 +88,9 @@ interface Fragment {
 
 const fragments = new Map<string, Map<number, Fragment>>();
 
-let onMessage: (evt: any) => void;
+// Map of request callbacks keyed by requestID to handle concurrent requests correctly
+// Each Lambda instance can handle multiple concurrent requests, and each needs its own callback
+const requestCallbacks = new Map<string, (evt: any) => void>();
 
 device.on("message", async (_topic, buffer: Buffer) => {
   const fragment = JSON.parse(buffer.toString()) as Fragment;
@@ -107,7 +120,12 @@ device.on("message", async (_topic, buffer: Buffer) => {
         })
       );
       const str = await result.Body!.transformToString();
-      onMessage(JSON.parse(str));
+      const pointerEvt = JSON.parse(str);
+      // Route to specific request callback using requestID
+      const requestID = pointerEvt.properties?.requestID;
+      if (requestID && requestCallbacks.has(requestID)) {
+        requestCallbacks.get(requestID)!(pointerEvt);
+      }
       await s3.send(
         new DeleteObjectCommand({
           Key: evt.properties.key,
@@ -116,35 +134,55 @@ device.on("message", async (_topic, buffer: Buffer) => {
       );
       return;
     }
-    onMessage(evt);
+    // Route to specific request callback using requestID
+    const requestID = evt.properties?.requestID;
+    if (requestID && requestCallbacks.has(requestID)) {
+      requestCallbacks.get(requestID)!(evt);
+    }
   }
 });
 
 export async function handler(event: any, context: any) {
-  const result = await new Promise<any>((r) => {
+  const requestID = context.awsRequestId;
+
+  if (!isConnected) {
+    console.log("Waiting for IoT connection...");
+    await new Promise<void>((resolve) => {
+      device.once("connect", () => resolve());
+    });
+  }
+
+  const result = await new Promise<any>((resolve) => {
     const timeout = setTimeout(() => {
-      r({
+      requestCallbacks.delete(requestID);
+      resolve({
         type: "function.timeout",
       });
-    }, 5 * 1000);
-    onMessage = (evt) => {
+    }, 25 * 1000);
+
+    // Register callback for this specific request using requestID as key
+    requestCallbacks.set(requestID, (evt) => {
       if (evt.type === "function.ack") {
+        // Verify this ACK is for our request
         if (evt.properties.workerID === workerID) {
-          clearTimeout(timeout);
+clearTimeout(timeout);
         }
       }
       if (["function.success", "function.error"].includes(evt.type)) {
+        // Verify this response is for our request
         if (evt.properties.workerID === workerID) {
           clearTimeout(timeout);
-          r(evt);
+          requestCallbacks.delete(requestID);
+          resolve(evt);
         }
       }
-    };
+    });
+
     for (const fragment of encode({
       type: "function.invoked",
       properties: {
         workerID: workerID,
-        requestID: context.awsRequestId,
+        requestID: requestID,
         functionID: process.env.SST_FUNCTION_ID,
         deadline: context.getRemainingTimeInMillis(),
         event,
