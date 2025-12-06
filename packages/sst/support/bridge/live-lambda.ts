@@ -1,4 +1,4 @@
-import iot from "aws-iot-device-sdk";
+ import iot from "aws-iot-device-sdk";
 import crypto from "crypto";
 import { IoTClient, DescribeEndpointCommand } from "@aws-sdk/client-iot";
 import {
@@ -165,7 +165,7 @@ export async function handler(event: any, context: any) {
       if (evt.type === "function.ack") {
         // Verify this ACK is for our request
         if (evt.properties.workerID === workerID) {
-          // Note: Don't clear timeout on ACK, only on success/error
+clearTimeout(timeout);
         }
       }
       if (["function.success", "function.error"].includes(evt.type)) {
