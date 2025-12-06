@@ -2,6 +2,7 @@ import express from "express";
 import { Events, useBus } from "../bus.js";
 import { Logger } from "../logger.js";
 import { useRuntimeWorkers } from "./workers.js";
+import { useFunctions } from "../constructs/Function.js";
 import https from "https";
 import getPort from "get-port";
 import { lazy } from "../util/lazy.js";
@@ -112,6 +113,11 @@ export const useRuntimeServer = lazy(async () => {
       );
       const payload = await next(req.params.workerID);
       Logger.debug("Worker", req.params.workerID, "sending next payload");
+
+      // Get function properties for per-invocation context
+      // This is essential for mono-build shared workers that serve multiple functions
+      const funcProps = useFunctions().fromID(payload.functionID);
+
       res.set({
         "Lambda-Runtime-Aws-Request-Id": payload.context.awsRequestId,
         "Lambda-Runtime-Deadline-Ms": Date.now() + payload.deadline,
@@ -127,6 +133,10 @@ export const useRuntimeServer = lazy(async () => {
         "Lambda-Runtime-Log-Stream-Name": payload.context.logStreamName,
         // Pass function ID for mono-build shared pool: allows per-invocation dispatch
         "Lambda-Runtime-Sst-Function-Id": payload.functionID,
+        // Per-invocation function context for mono-build shared workers
+        "Lambda-Runtime-Function-Name": funcProps?.functionName || "",
+        "Lambda-Runtime-Function-Version": "$LATEST",
+        "Lambda-Runtime-Function-Memory-Size": String(funcProps?.memorySize || 1024),
       });
       // Wrap event with env for per-invocation environment variable application
       // This prevents env leakage when workers are reused across different functions

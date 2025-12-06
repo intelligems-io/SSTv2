@@ -13,6 +13,7 @@ import {Colors} from "../../cli/colors.js";
 import {Logger} from "../../logger.js";
 import {findAbove, findBelow} from "../../util/fs.js";
 import {lazy} from "../../util/lazy.js";
+import {useMonoBuildConfig} from "../mono-build-config.js";
 
 export const useNodeHandler = (): RuntimeHandler => {
   const rebuildCache: Record<
@@ -73,15 +74,13 @@ export const useNodeHandler = (): RuntimeHandler => {
       await worker?.terminate();
     },
     build: async (input) => {
-      // Check for dev mode mono-bundle: if .mono-build/index.mjs exists, skip individual builds
-      const monoBundleDir = path.join(project.paths.root, ".mono-build");
-      const monoBundlePath = path.join(monoBundleDir, "index.mjs");
-      const monoBundleExists = fsSync.existsSync(monoBundlePath);
-      if (input.mode === "start" && monoBundleExists) {
+      // Check for dev mode mono-bundle using global config
+      const monoBuildConfig = useMonoBuildConfig();
+      if (input.mode === "start" && monoBuildConfig.enabled) {
         Colors.line(
           Colors.prefix,
           Colors.dim.bold("MonoBundle"),
-          Colors.dim(`mode=${input.mode}, exists=${monoBundleExists}, handler=${input.props.handler}`)
+          Colors.dim(`mode=${input.mode}, handler=${input.props.handler}`)
         );
 
         // Symlink node_modules to mono-bundle dir for external dependencies
@@ -91,7 +90,7 @@ export const useNodeHandler = (): RuntimeHandler => {
         const root = await findAbove(handlerFunctionsDir, "package.json");
         if (root) {
           const sourceNodeModules = path.resolve(root, "node_modules");
-          const monoBundleNodeModules = path.join(monoBundleDir, "node_modules");
+          const monoBundleNodeModules = path.join(monoBuildConfig.dir, "node_modules");
           try {
             const existingTarget = await fs.readlink(monoBundleNodeModules);
             if (existingTarget === sourceNodeModules) {
@@ -115,8 +114,8 @@ export const useNodeHandler = (): RuntimeHandler => {
 
         return {
           type: "success" as const,
-          handler: "index.handler",
-          out: monoBundleDir,
+          handler: monoBuildConfig.handler,
+          out: monoBuildConfig.dir,
         };
       }
 
