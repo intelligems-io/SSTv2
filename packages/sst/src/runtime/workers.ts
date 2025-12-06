@@ -899,9 +899,10 @@ export const useRuntimeWorkers = lazy(async () => {
       let success = 0;
       let failed = 0;
 
-      // Import AWS SDK dynamically
+      // Use the shared AWS client
+      const { useAWSClient } = await import("../credentials.js");
       const { LambdaClient, InvokeCommand } = await import("@aws-sdk/client-lambda");
-      const lambda = new LambdaClient({});
+      const lambda = useAWSClient(LambdaClient);
 
       // Phase 1: Invoke first warmup to populate V8 compile cache
       try {
