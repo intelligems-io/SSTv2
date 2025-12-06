@@ -18,6 +18,8 @@ import {
   writeSessionEndSummary,
 } from "./worker-pool-logging.js";
 import {useMonoBuildConfig, isMonoBuildPath} from "./mono-build-config.js";
+import {getRequestPath} from "./request-utils.js";
+import {logWorkers} from "./debug-bridge-logging.js";
 
 declare module "../bus.js" {
   export interface Events {
@@ -520,12 +522,15 @@ export const useRuntimeWorkers = lazy(async () => {
     } = evt.properties;
 
     const startTime = Date.now();
+    const requestPath = getRequestPath(event);
 
     // Check if this is a warmup request - force-create new workers for these
     // Matches the warmer format: { ding: true } or { warmer: true }
     const isWarmupRequest = event && typeof event === 'object' &&
       ('ding' in (event as any) || 'warmer' in (event as any) || (event as any).__sst_warmup === true);
     const warmupId = isWarmupRequest ? ((event as any).warmupId ?? (event as any).index) : undefined;
+
+    logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} RECEIVED func=${functionID.slice(-30)}`);
 
     if (isWarmupRequest) {
       logInvokeTrace("WARMUP_RECEIVED", requestID, `warmupId=${warmupId}`);
@@ -535,10 +540,12 @@ export const useRuntimeWorkers = lazy(async () => {
 
     // Send ack immediately
     bus.publish("function.ack", {functionID, workerID: awsWorkerID, requestID});
+    logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} ACK sent elapsed=${Date.now() - startTime}ms`);
     logInvokeTrace("ACK_PUBLISHED", requestID, `elapsed=${Date.now() - startTime}ms`);
 
     const props = useFunctions().fromID(functionID);
     if (!props) {
+      logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} ERROR: Function not found`);
       Logger.debug("Function not found:", functionID);
       bus.publish("function.error", {
         workerID: awsWorkerID,
@@ -553,6 +560,7 @@ export const useRuntimeWorkers = lazy(async () => {
 
     const handler = handlers.for(props.runtime!);
     if (!handler) {
+      logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} ERROR: No handler for runtime ${props.runtime}`);
       Logger.debug("No handler for runtime:", props.runtime);
       bus.publish("function.error", {
         workerID: awsWorkerID,
@@ -565,10 +573,15 @@ export const useRuntimeWorkers = lazy(async () => {
       return;
     }
 
+    logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} Getting build artifact...`);
     logInvokeTrace("BUILD_ARTIFACT_START", requestID);
+    const buildStartTime = Date.now();
     const build = await builder.artifact(functionID);
+    const buildElapsed = Date.now() - buildStartTime;
+    logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} Build artifact took ${buildElapsed}ms`);
     logInvokeTrace("BUILD_ARTIFACT_DONE", requestID, build ? `out=${build.out.slice(-30)}` : "NO_BUILD");
     if (!build) {
+      logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} ERROR: Build artifact not ready`);
       Logger.debug("Build artifact not ready for:", functionID);
       bus.publish("function.error", {
         workerID: awsWorkerID,
@@ -593,6 +606,8 @@ export const useRuntimeWorkers = lazy(async () => {
         build.out
       );
 
+      logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} Looking for pooled worker, poolKey=${poolKey.slice(0, 20)}`);
+
       // For warmup requests, always create new workers (never reuse from pool)
       let pooledWorker = isWarmupRequest ? undefined : getIdleWorker(poolKey, functionID, build.out);
       let isReuse = false;
@@ -602,6 +617,7 @@ export const useRuntimeWorkers = lazy(async () => {
         // Update functionID for cross-function reuse (mono-build)
         pooledWorker.functionID = functionID;
         trackRequestStart(functionID, true);
+        logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} REUSING pooled worker ${pooledWorker.pooledWorkerID.slice(0, 8)}`);
       } else {
         // Create new pooled worker
         const pooledWorkerID = crypto.randomBytes(16).toString("hex");
@@ -616,6 +632,7 @@ export const useRuntimeWorkers = lazy(async () => {
           bundlePath: build.out,
           bundleMtime,
         };
+        logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} CREATING new pooled worker ${pooledWorkerID.slice(0, 8)}`);
       }
 
       // Set up mappings
@@ -640,7 +657,9 @@ export const useRuntimeWorkers = lazy(async () => {
           ...(isWarmupRequest && { warmupId }),
         });
 
+        logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} Starting worker ${pooledWorker.pooledWorkerID.slice(0, 8)}...`);
         logInvokeTrace("WORKER_START", requestID, `pooled=${pooledWorker.pooledWorkerID.slice(0, 8)}`);
+        const workerStartTime = Date.now();
         try {
           await handler.startWorker({
             ...build,
@@ -652,13 +671,15 @@ export const useRuntimeWorkers = lazy(async () => {
             isMonoBuild: isShared,
           });
           startedWorkers.add(pooledWorker.pooledWorkerID);
+          logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} Worker started in ${Date.now() - workerStartTime}ms`);
           logInvokeTrace("WORKER_STARTED", requestID);
-  
+
           bus.publish("worker.started", {
             workerID: awsWorkerID,
             functionID,
           });
         } catch (ex: any) {
+          logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} ERROR: Failed to start worker: ${ex.message}`);
           Logger.debug("Failed to start pooled worker", ex);
           bus.publish("function.error", {
             workerID: awsWorkerID,
@@ -687,6 +708,7 @@ export const useRuntimeWorkers = lazy(async () => {
 
       // Route invocation to the pooled worker
       const server = await getServer();
+      logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} Routing invocation to worker ${pooledWorker.pooledWorkerID.slice(0, 8)} elapsed=${Date.now() - startTime}ms`);
       logInvokeTrace("ROUTE_INVOCATION", requestID);
       server.routeInvocation(pooledWorker.pooledWorkerID, evt.properties);
     } else {
@@ -706,10 +728,10 @@ export const useRuntimeWorkers = lazy(async () => {
           runtime: props.runtime!,
           isMonoBuild: isMonoBuildPath(build.out),
         });
-  
+
         workers.set(awsWorkerID, {workerID: awsWorkerID, functionID});
         bus.publish("worker.started", {workerID: awsWorkerID, functionID});
-  
+
         // Route invocation to the non-pooled worker
         const server = await getServer();
         server.routeInvocation(awsWorkerID, evt.properties);

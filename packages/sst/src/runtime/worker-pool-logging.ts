@@ -1,5 +1,4 @@
-import fs from "fs";
-import path from "path";
+import { createDebugFileLogger, DebugFileLogger } from "./debug-file-logger.js";
 
 // Configuration
 const SST_BUILD_CONCURRENCY = parseInt(
@@ -40,7 +39,21 @@ const metrics: PoolMetrics = {
   responseCount: new Map(),
 };
 
-let logStream: fs.WriteStream | null = null;
+// Create pool logger using the abstract logger
+let poolLogger: DebugFileLogger | null = null;
+
+function getPoolLogger(): DebugFileLogger | null {
+  if (!DEBUG_POOL) return null;
+  if (!poolLogger) {
+    poolLogger = createDebugFileLogger({
+      filePath: DEBUG_POOL_FILE,
+      sessionName: "POOL",
+      sessionHeader: `POOL_SIZE=${POOL_SIZE} IDLE_TIMEOUT=${IDLE_TIMEOUT}ms BUILD_CONCURRENCY=${SST_BUILD_CONCURRENCY}`,
+      width: 100,
+    });
+  }
+  return poolLogger;
+}
 
 // Function name resolver - set by workers.ts
 let functionNameResolver: (functionID: string) => string = (id) =>
@@ -54,24 +67,6 @@ export function setFunctionNameResolver(
   resolver: (functionID: string) => string
 ) {
   functionNameResolver = resolver;
-}
-
-function initLogFile() {
-  if (!DEBUG_POOL || logStream) return;
-  try {
-    const logDir = path.dirname(DEBUG_POOL_FILE);
-    if (!fs.existsSync(logDir)) {
-      fs.mkdirSync(logDir, { recursive: true });
-    }
-    logStream = fs.createWriteStream(DEBUG_POOL_FILE, { flags: "w" });
-    logStream.write(
-      "\n" + "=".repeat(100) + "\n" +
-        "[SESSION START] " + new Date().toISOString() + " | POOL_SIZE=" + POOL_SIZE + " IDLE_TIMEOUT=" + IDLE_TIMEOUT + "ms BUILD_CONCURRENCY=" + SST_BUILD_CONCURRENCY + "\n" +
-        "=".repeat(100) + "\n"
-    );
-  } catch {
-    // Fall back to no logging if file creation fails
-  }
 }
 
 // Extract readable function name from handler path
@@ -90,34 +85,33 @@ function getBottleneckFlags(functionID: string): string {
 
   // SATURATED: All pool slots in use
   if (concurrent >= POOL_SIZE) {
-    flags.push("🚨 SATURATED");
+    flags.push("SATURATED");
   }
   // HIGH_LOAD: >70% pool utilization
   else if (concurrent >= POOL_SIZE * 0.7) {
-    flags.push("⚠️ HIGH_LOAD");
+    flags.push("HIGH_LOAD");
   }
 
   // COLD_START: Low hit rate indicates frequent cold starts
   if (total >= 5 && hitRate < 30) {
-    flags.push("❄️ LOW_REUSE");
+    flags.push("LOW_REUSE");
   }
 
   // BOTTLENECK: High cold start ratio
   if (total >= 3 && coldStarts / total > 0.5) {
-    flags.push("🔥 COLD_HEAVY");
+    flags.push("COLD_HEAVY");
   }
 
-  return flags.length > 0 ? " " + flags.join(" ") : "";
+  return flags.length > 0 ? " [" + flags.join(" ") + "]" : "";
 }
 
 /**
  * Pool debug logging helper - writes to file with bottleneck detection
  */
 export function logPool(action: string, details: Record<string, any> = {}) {
-  if (!DEBUG_POOL) return;
-  initLogFile();
+  const logger = getPoolLogger();
+  if (!logger) return;
 
-  const timestamp = new Date().toISOString().slice(11, 23); // HH:MM:SS.mmm
   const funcName = details.functionID
     ? getFunctionName(details.functionID)
     : "";
@@ -134,23 +128,35 @@ export function logPool(action: string, details: Record<string, any> = {}) {
     const total = metrics.totalRequests.get(details.functionID) || 0;
     const hits = metrics.poolHits.get(details.functionID) || 0;
     const hitRate = total > 0 ? ((hits / total) * 100).toFixed(0) : "0";
-    metricsStr = " | concurrent=" + concurrent + " hitRate=" + hitRate + "%";
+    metricsStr = `concurrent=${concurrent} hitRate=${hitRate}%`;
   }
 
-  // Format details, replacing functionID with funcName
-  const filteredDetails = { ...details };
-  delete filteredDetails.functionID;
-  const detailStr = Object.entries(filteredDetails)
-    .map(([k, v]) => k + "=" + (typeof v === "object" ? JSON.stringify(v) : v))
-    .join(" ");
+  // Build the log details
+  const logDetails: Record<string, any> = {};
 
-  const actionPadded = action.padEnd(14);
-  const funcPadded = funcName.padEnd(25);
-  const line = "[" + timestamp + "] " + actionPadded + " " + funcPadded + " " + detailStr + metricsStr + bottleneckFlags + "\n";
-
-  if (logStream) {
-    logStream.write(line);
+  // Add function name first if present
+  if (funcName) {
+    logDetails.func = funcName;
   }
+
+  // Add all other details except functionID
+  for (const [k, v] of Object.entries(details)) {
+    if (k !== "functionID") {
+      logDetails[k] = v;
+    }
+  }
+
+  // Add metrics if present
+  if (metricsStr) {
+    logDetails.metrics = metricsStr;
+  }
+
+  // Add bottleneck flags
+  if (bottleneckFlags) {
+    logDetails.status = bottleneckFlags.trim();
+  }
+
+  logger.log(action, logDetails);
 }
 
 /**
@@ -197,41 +203,34 @@ export function trackRequestEnd(functionID: string) {
  * Called from workers.ts on process exit
  */
 export function writeSessionEndSummary() {
-  if (!DEBUG_POOL || !logStream) return;
+  const logger = getPoolLogger();
+  if (!logger) return;
 
-  let summary = "\n" + "─".repeat(100) + "\n[SESSION END] " + new Date().toISOString() + "\n";
+  let summary = "";
   for (const [funcID, total] of metrics.totalRequests) {
     const hits = metrics.poolHits.get(funcID) || 0;
     const cold = metrics.coldStarts.get(funcID) || 0;
     const peak = metrics.peakConcurrent.get(funcID) || 0;
     const hitRate = total > 0 ? ((hits / total) * 100).toFixed(1) : "0";
     const funcName = getFunctionName(funcID);
-    summary += "  " + funcName.padEnd(25) + " total=" + total + " poolHits=" + hits + " coldStarts=" + cold + " peakConcurrent=" + peak + " hitRate=" + hitRate + "%\n";
+    summary += `  ${funcName.padEnd(25)} total=${total} poolHits=${hits} coldStarts=${cold} peakConcurrent=${peak} hitRate=${hitRate}%\n`;
   }
-  summary += "─".repeat(100) + "\n";
-  logStream.write(summary);
-  logStream.end();
+
+  logger.close(summary);
 }
 
-// Invocation trace logging - always enabled, writes to separate file
-let traceStream: fs.WriteStream | null = null;
+// Invocation trace logging - uses the abstract logger
+let traceLogger: DebugFileLogger | null = null;
 
-function initTraceFile() {
-  if (traceStream) return;
-  try {
-    const logDir = path.dirname(INVOKE_TRACE_FILE);
-    if (!fs.existsSync(logDir)) {
-      fs.mkdirSync(logDir, { recursive: true });
-    }
-    traceStream = fs.createWriteStream(INVOKE_TRACE_FILE, { flags: "w" });
-    traceStream.write(
-      "\n" + "=".repeat(80) + "\n" +
-        "[TRACE START] " + new Date().toISOString() + "\n" +
-        "=".repeat(80) + "\n"
-    );
-  } catch {
-    // Fall back to no logging if file creation fails
+function getTraceLogger(): DebugFileLogger {
+  if (!traceLogger) {
+    traceLogger = createDebugFileLogger({
+      filePath: INVOKE_TRACE_FILE,
+      sessionName: "TRACE",
+      width: 80,
+    });
   }
+  return traceLogger;
 }
 
 /**
@@ -239,10 +238,9 @@ function initTraceFile() {
  * Always enabled for debugging invocation flow
  */
 export function logInvokeTrace(stage: string, requestID: string, details?: string) {
-  initTraceFile();
-  if (!traceStream) return;
-
-  const timestamp = new Date().toISOString().slice(11, 23); // HH:MM:SS.mmm
-  const line = `[${timestamp}] ${stage.padEnd(20)} req=${requestID.slice(0, 8)} ${details || ""}\n`;
-  traceStream.write(line);
+  const logger = getTraceLogger();
+  logger.log(stage, {
+    req: requestID.slice(0, 8),
+    ...(details ? { info: details } : {}),
+  });
 }
