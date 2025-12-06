@@ -166,9 +166,10 @@ while (true) {
       clientContext:
         JSON.parse(result.headers["lambda-runtime-client-context"]) ??
         undefined,
-      functionName: process.env.AWS_LAMBDA_FUNCTION_NAME!,
-      functionVersion: process.env.AWS_LAMBDA_FUNCTION_VERSION!,
-      memoryLimitInMB: process.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE!,
+      // Per-invocation function context from headers (essential for mono-build shared workers)
+      functionName: result.headers["lambda-runtime-function-name"] || process.env.AWS_LAMBDA_FUNCTION_NAME!,
+      functionVersion: result.headers["lambda-runtime-function-version"] || process.env.AWS_LAMBDA_FUNCTION_VERSION!,
+      memoryLimitInMB: result.headers["lambda-runtime-function-memory-size"] || process.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE!,
       logGroupName: result.headers["lambda-runtime-log-group-name"],
       logStreamName: result.headers["lambda-runtime-log-stream-name"],
       callbackWaitsForEmptyEventLoop: {
