@@ -17,6 +17,7 @@ import {
   setFunctionNameResolver,
   writeSessionEndSummary,
 } from "./worker-pool-logging.js";
+import {Config} from "../config.js";
 
 declare module "../bus.js" {
   export interface Events {
@@ -42,6 +43,11 @@ declare module "../bus.js" {
       workerID: string;
       functionID: string;
       pooledWorkerID: string;
+    };
+    "worker.ready": {
+      workerID: string;
+      importTimeMs: number;
+      monoBuild: boolean;
     };
   }
 }
@@ -148,6 +154,54 @@ function getFunctionName(functionID: string): string {
   } catch {
     return functionID.slice(0, 25);
   }
+}
+
+// Cache for SST environment variables (fetched from SSM parameters)
+let cachedSstEnv: Record<string, string> | undefined;
+let sstEnvFetchPromise: Promise<Record<string, string>> | undefined;
+
+/**
+ * Get SST environment variables for prewarm workers.
+ * Uses Config.env() to fetch SSM parameters (same as `sst bind`).
+ * Caches the result since all functions share the same SST config.
+ */
+async function getSstEnvironment(): Promise<Record<string, string>> {
+  // Return cached env if available
+  if (cachedSstEnv) return cachedSstEnv;
+
+  // Deduplicate concurrent requests
+  if (sstEnvFetchPromise) return sstEnvFetchPromise;
+
+  const fetchEnv = async (): Promise<Record<string, string>> => {
+    try {
+      console.log(`[prewarm] Fetching SST environment from SSM...`);
+      const startTime = Date.now();
+
+      // Use Config.env() - same as sst bind uses
+      const sstEnv = await Config.env();
+
+      const elapsed = Date.now() - startTime;
+      console.log(`[prewarm] Fetched ${Object.keys(sstEnv).length} SST env vars in ${elapsed}ms`);
+
+      // Merge with process.env (SST env takes precedence)
+      const merged: Record<string, string> = {
+        ...process.env as Record<string, string>,
+        ...sstEnv,
+      };
+      cachedSstEnv = merged;
+      return merged;
+    } catch (ex: any) {
+      console.log(`[prewarm] Failed to fetch SST env: ${ex.message}, using local env`);
+      const fallback = process.env as Record<string, string>;
+      cachedSstEnv = fallback;
+      return fallback;
+    } finally {
+      sstEnvFetchPromise = undefined;
+    }
+  };
+
+  sstEnvFetchPromise = fetchEnv();
+  return sstEnvFetchPromise;
 }
 
 // Runtimes that support multiple invocations per process (have event loop)
@@ -756,6 +810,13 @@ export const useRuntimeWorkers = lazy(async () => {
         return;
       }
 
+      // Check if this is a preWarm worker (started but not yet active)
+      if (startedWorkers.has(workerID)) {
+        // During preWarm, log directly since there's no request context
+        console.log(`[worker:${workerID.slice(0, 8)}] ${message.trim()}`);
+        return;
+      }
+
       // Non-pooled worker
       const worker = workers.get(workerID);
       if (!worker) return;
@@ -839,5 +900,245 @@ export const useRuntimeWorkers = lazy(async () => {
       "worker.stdout",
       "worker.reused"
     ),
+
+    /**
+     * Pre-warm workers for mono-build mode.
+     * Creates idle workers upfront to avoid cold starts on first invocations.
+     * @param count Number of workers to pre-warm (default: 15)
+     */
+    async preWarm(count: number = 15) {
+      const functions = useFunctions();
+      const allFunctions = functions.all;
+
+      // Find a nodejs mono-build function to use as template
+      let templateFunction: { id: string; props: any; build: any } | null = null;
+
+      for (const [id, props] of Object.entries(allFunctions)) {
+        if (!props.runtime?.startsWith("nodejs")) continue;
+        if (!isPoolableRuntime(props.runtime!)) continue;
+
+        const build = await builder.artifact(id);
+        if (!build) continue;
+        if (!build.out.includes(".mono-build")) continue;
+
+        templateFunction = { id, props, build };
+        break;
+      }
+
+      if (!templateFunction) {
+        logPool("PREWARM_SKIP", {
+          reason: "no mono-build nodejs function found",
+        });
+        console.log(`\x1b[33m⚡ Pre-warm: Skipped (no mono-build function found)\x1b[0m`);
+        return { warmed: 0 };
+      }
+
+      const { id: functionID, props, build } = templateFunction;
+
+      // Wait for bundle to be stable before pre-warming
+      // This prevents starting workers while esbuild is still writing files
+      const timestampFile = path.join(build.out, ".last-rebuild");
+      console.log(`\x1b[36m⚡ Pre-warm: Waiting for bundle to stabilize...\x1b[0m`);
+
+      let lastMtime = 0;
+      let stableCount = 0;
+      const STABLE_THRESHOLD = 3; // Need 3 consecutive stable checks (3 seconds)
+
+      while (stableCount < STABLE_THRESHOLD) {
+        await new Promise((r) => setTimeout(r, 1000));
+        try {
+          const content = fs.readFileSync(timestampFile, "utf-8");
+          const mtime = parseInt(content, 10);
+          if (mtime === lastMtime) {
+            stableCount++;
+          } else {
+            lastMtime = mtime;
+            stableCount = 0;
+          }
+        } catch {
+          // File doesn't exist yet, keep waiting
+          stableCount = 0;
+        }
+      }
+
+      console.log(`\x1b[36m⚡ Pre-warm: Bundle stable, starting workers...\x1b[0m`);
+
+      await getServer();
+
+      // Fetch SST environment from SSM (same as sst bind uses)
+      const sstEnv = await getSstEnvironment();
+
+      const handler = handlers.for(props.runtime!);
+      if (!handler) {
+        logPool("PREWARM_SKIP", {
+          reason: "no handler for runtime",
+          runtime: props.runtime,
+        });
+        console.log(`\x1b[33m⚡ Pre-warm: Skipped (no handler for ${props.runtime})\x1b[0m`);
+        return { warmed: 0 };
+      }
+
+      const { key: poolKey, isShared } = getPoolKey(
+        functionID,
+        props.runtime!,
+        build.out
+      );
+      const bundleMtime = getBundleMtime(build.out);
+
+      logPool("PREWARM_START", {
+        count,
+        functionID,
+        runtime: props.runtime,
+        poolKey: poolKey.slice(0, 30),
+      });
+
+      console.log(`\x1b[36m⚡ Pre-warming ${count} workers for mono-build...\x1b[0m`);
+
+      let spawned = 0;
+      let ready = 0;
+      let failed = 0;
+      const startTime = Date.now();
+
+      // Track workers waiting for ready signal
+      const pendingWorkers = new Map<string, {
+        pooledWorker: PooledWorker;
+        resolve: () => void;
+      }>();
+
+      // Subscribe to worker.ready events
+      const readySubscription = bus.subscribe("worker.ready", (evt) => {
+        console.log(`[prewarm] Received worker.ready for ${evt.properties.workerID.slice(0, 8)}, pending count: ${pendingWorkers.size}`);
+        const pending = pendingWorkers.get(evt.properties.workerID);
+        if (pending) {
+          ready++;
+          const progress = ready;
+          const bar = "█".repeat(Math.round((progress / count) * 20)).padEnd(20, "░");
+          const avgTime = ready > 0 ? Math.round((Date.now() - startTime) / ready) : 0;
+          process.stdout.write(`\r\x1b[36m⚡ Pre-warm: [${bar}] ${progress}/${count} ready (${evt.properties.importTimeMs}ms import, ~${avgTime}ms avg)\x1b[0m`);
+
+          // Add to idle pool now that import is complete
+          let pool = workerPool.get(poolKey);
+          if (!pool) {
+            pool = [];
+            workerPool.set(poolKey, pool);
+          }
+
+          pending.pooledWorker.idleTimer = setTimeout(() => {
+            const idx = pool!.indexOf(pending.pooledWorker);
+            if (idx >= 0) pool!.splice(idx, 1);
+            terminatePooledWorker(pending.pooledWorker.pooledWorkerID, "idle_timeout");
+          }, IDLE_TIMEOUT);
+
+          pool.push(pending.pooledWorker);
+
+          logPool("PREWARM_WORKER", {
+            pooledWorkerID: pending.pooledWorker.pooledWorkerID.slice(0, 8),
+            workerNum: ready,
+            poolSize: pool.length,
+            importTimeMs: evt.properties.importTimeMs,
+          });
+
+          pendingWorkers.delete(evt.properties.workerID);
+          pending.resolve();
+        }
+      });
+
+      // V8 Compile Cache Strategy:
+      // 1. Start first worker - it compiles and caches bytecode to disk
+      // 2. Wait for first worker to complete (populates cache)
+      // 3. Start remaining workers in parallel - they load from cache (fast)
+      const HARD_TIMEOUT = 10 * 60 * 1000; // 10 min - give up entirely
+
+      // Helper to create and start a worker
+      const createWorker = (index: number): { promise: Promise<void>; id: string } => {
+        const pooledWorkerID = crypto.randomBytes(16).toString("hex");
+        const pooledWorker: PooledWorker = {
+          pooledWorkerID,
+          functionID,
+          state: "idle",
+          createdAt: Date.now(),
+          poolKey,
+          isSharedPool: isShared,
+          bundlePath: build.out,
+          bundleMtime,
+        };
+
+        const readyPromise = new Promise<void>((resolve) => {
+          pendingWorkers.set(pooledWorkerID, {
+            pooledWorker,
+            resolve: () => resolve()
+          });
+
+          // Hard timeout
+          setTimeout(() => {
+            if (pendingWorkers.has(pooledWorkerID)) {
+              pendingWorkers.delete(pooledWorkerID);
+              failed++;
+              console.log(`[prewarm] Worker ${pooledWorkerID.slice(0, 8)} timeout`);
+              resolve();
+            }
+          }, HARD_TIMEOUT);
+        });
+
+        startedWorkers.add(pooledWorkerID);
+        spawned++;
+
+        console.log(`[prewarm] Starting worker ${index + 1}/${count} (${pooledWorkerID.slice(0, 8)})...`);
+        handler.startWorker({
+          ...build,
+          workerID: pooledWorkerID,
+          functionID,
+          environment: sstEnv,
+          url: `${serverConfig.url}/${pooledWorkerID}/${serverConfig.API_VERSION}`,
+          runtime: props.runtime!,
+        }).catch((ex: any) => {
+          startedWorkers.delete(pooledWorkerID);
+          pendingWorkers.delete(pooledWorkerID);
+          failed++;
+          spawned--;
+        });
+
+        return { promise: readyPromise, id: pooledWorkerID };
+      };
+
+      // Phase 1: Start first worker and wait for it (populates V8 compile cache)
+      console.log(`[prewarm] Phase 1: Starting first worker to populate V8 compile cache...`);
+      const firstWorker = createWorker(0);
+      await firstWorker.promise;
+      const firstWorkerTime = Date.now() - startTime;
+      console.log(`[prewarm] First worker ready in ${firstWorkerTime}ms (cache populated)`);
+
+      // Phase 2: Start remaining workers in parallel (they load from cache)
+      if (count > 1) {
+        console.log(`[prewarm] Phase 2: Starting ${count - 1} workers in parallel (using cached bytecode)...`);
+        const remainingPromises: Promise<void>[] = [];
+        for (let i = 1; i < count; i++) {
+          const worker = createWorker(i);
+          remainingPromises.push(worker.promise);
+        }
+        await Promise.all(remainingPromises);
+      }
+
+      bus.unsubscribe(readySubscription);
+
+      const elapsed = Date.now() - startTime;
+      logPool("PREWARM_DONE", {
+        warmed: ready,
+        requested: count,
+        elapsedMs: elapsed,
+        poolKey: poolKey.slice(0, 30),
+        avgMs: ready > 0 ? Math.round(elapsed / ready) : 0,
+      });
+
+      // Clear progress line and print final status
+      process.stdout.write("\r" + " ".repeat(100) + "\r");
+      if (failed === 0) {
+        console.log(`\x1b[32m⚡ Pre-warm complete: ${ready} workers ready (${(elapsed / 1000).toFixed(1)}s, ~${ready > 0 ? Math.round(elapsed / ready) : 0}ms/worker)\x1b[0m`);
+      } else {
+        console.log(`\x1b[33m⚡ Pre-warm complete: ${ready}/${count} workers ready, ${failed} failed (${(elapsed / 1000).toFixed(1)}s)\x1b[0m`);
+      }
+
+      return { warmed: ready, elapsed };
+    },
   };
 });

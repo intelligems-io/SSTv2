@@ -463,6 +463,12 @@ export const dev = (program: Program) =>
           import("./plugins/warmer.js").then((mod) => mod.useRDSWarmer()),
           useFunctionLogger(),
         ]);
+
+        // Pre-warm workers for mono-build mode to avoid cold starts
+        import("../../runtime/workers.js").then(async (mod) => {
+          const workers = await mod.useRuntimeWorkers();
+          await workers.preWarm(15);
+        });
       } catch (e: any) {
         await exitWithError(e);
       }
