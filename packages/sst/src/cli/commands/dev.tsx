@@ -66,6 +66,15 @@ export const dev = (program: Program) =>
           }
           const pending = new Map<string, Pending>();
 
+          // Track warmup request IDs to suppress their logs
+          const warmupRequestIDs = new Set<string>();
+
+          // Helper to check if an event payload is a warmup request
+          function isWarmupEvent(event: any): boolean {
+            return event && typeof event === 'object' &&
+              ('ding' in event || 'warmer' in event || event.__sst_warmup === true);
+          }
+
           function prefix(requestID: string): string {
             const exists = pending.get(requestID);
             if (exists) {
@@ -83,9 +92,46 @@ export const dev = (program: Program) =>
             // index--;
             // if (index < 0) index = colors.length - 1;
             pending.delete(requestID);
+            warmupRequestIDs.delete(requestID);
           }
 
+          // Warmup progress bar state
+          let warmupSpinner: ReturnType<typeof createSpinner> | null = null;
+          let warmupTotal = 0;
+          let warmupCompleted = 0;
+
+          bus.subscribe("warmup.start", async (evt) => {
+            warmupTotal = evt.properties.count;
+            warmupCompleted = 0;
+            warmupSpinner = createSpinner({
+              color: "cyan",
+              text: Colors.dim(` Warming up workers... 0/${warmupTotal}`),
+            }).start();
+          });
+
+          bus.subscribe("warmup.progress", async (evt) => {
+            warmupCompleted = evt.properties.completed;
+            if (warmupSpinner) {
+              warmupSpinner.text = Colors.dim(` Warming up workers... ${warmupCompleted}/${warmupTotal}`);
+            }
+          });
+
+          bus.subscribe("warmup.complete", async (evt) => {
+            if (warmupSpinner) {
+              warmupSpinner.succeed(
+                Colors.dim(` Warmed up ${evt.properties.success} workers in ${evt.properties.elapsedMs}ms`)
+              );
+              warmupSpinner = null;
+            }
+          });
+
           bus.subscribe("function.invoked", async (evt) => {
+            // Check if this is a warmup request and track it
+            if (isWarmupEvent(evt.properties.event)) {
+              warmupRequestIDs.add(evt.properties.requestID);
+              return; // Don't log warmup invocations
+            }
+
             Colors.line(
               prefix(evt.properties.requestID),
               Colors.dim.bold("Invoked"),
@@ -96,9 +142,14 @@ export const dev = (program: Program) =>
           });
 
           bus.subscribe("worker.stdout", async (evt) => {
+            // Skip warmup request logs
+            if (warmupRequestIDs.has(evt.properties.requestID)) return;
+
             const info = useFunctions().fromID(evt.properties.functionID);
             prefix(evt.properties.requestID);
-            const { started } = pending.get(evt.properties.requestID)!;
+            const pendingReq = pending.get(evt.properties.requestID);
+            if (!pendingReq) return; // Safety check
+            const { started } = pendingReq;
             for (let line of evt.properties.message.split("\n")) {
               // Remove prefix from container logs
               if (info?.runtime === "container") {
@@ -156,9 +207,16 @@ export const dev = (program: Program) =>
           });
 
           bus.subscribe("function.success", async (evt) => {
+            // Skip warmup request logs
+            if (warmupRequestIDs.has(evt.properties.requestID)) {
+              end(evt.properties.requestID);
+              return;
+            }
+
             // stdout logs sometimes come in after
             const p = prefix(evt.properties.requestID);
-            const req = pending.get(evt.properties.requestID)!;
+            const req = pending.get(evt.properties.requestID);
+            if (!req) return; // Safety check
             setTimeout(() => {
               Colors.line(
                 p,
@@ -169,6 +227,12 @@ export const dev = (program: Program) =>
           });
 
           bus.subscribe("function.error", async (evt) => {
+            // Skip warmup request logs
+            if (warmupRequestIDs.has(evt.properties.requestID)) {
+              end(evt.properties.requestID);
+              return;
+            }
+
             setTimeout(() => {
               Colors.line(
                 prefix(evt.properties.requestID),

@@ -43,6 +43,20 @@ declare module "../bus.js" {
       functionID: string;
       pooledWorkerID: string;
     };
+    "warmup.start": {
+      count: number;
+    };
+    "warmup.progress": {
+      completed: number;
+      total: number;
+      success: number;
+      failed: number;
+    };
+    "warmup.complete": {
+      success: number;
+      failed: number;
+      elapsedMs: number;
+    };
   }
 }
 
@@ -895,13 +909,27 @@ export const useRuntimeWorkers = lazy(async () => {
         functionName,
       });
 
+      // Publish warmup start event
+      bus.publish("warmup.start", { count });
+
       const startTime = Date.now();
       let success = 0;
       let failed = 0;
+      let completed = 0;
 
       // Import AWS SDK dynamically
       const { LambdaClient, InvokeCommand } = await import("@aws-sdk/client-lambda");
       const lambda = new LambdaClient({});
+
+      // Helper to publish progress
+      const publishProgress = () => {
+        bus.publish("warmup.progress", {
+          completed,
+          total: count,
+          success,
+          failed,
+        });
+      };
 
       // Phase 1: Invoke first warmup to populate V8 compile cache
       try {
@@ -924,6 +952,8 @@ export const useRuntimeWorkers = lazy(async () => {
       } catch (ex: any) {
         failed++;
       }
+      completed++;
+      publishProgress();
 
       // Phase 2: Invoke remaining warmups in parallel
       if (count > 1) {
@@ -941,17 +971,20 @@ export const useRuntimeWorkers = lazy(async () => {
                   }),
                 })
               );
-              return result.StatusCode === 200;
+              const ok = result.StatusCode === 200;
+              if (ok) success++;
+              else failed++;
+              completed++;
+              publishProgress();
+              return ok;
             } catch {
+              failed++;
+              completed++;
+              publishProgress();
               return false;
             }
           })
         );
-
-        for (const ok of results) {
-          if (ok) success++;
-          else failed++;
-        }
       }
 
       const elapsed = Date.now() - startTime;
@@ -960,6 +993,13 @@ export const useRuntimeWorkers = lazy(async () => {
         failed,
         elapsedMs: elapsed,
         avgMs: success > 0 ? Math.round(elapsed / success) : 0,
+      });
+
+      // Publish warmup complete event
+      bus.publish("warmup.complete", {
+        success,
+        failed,
+        elapsedMs: elapsed,
       });
 
       return { warmed: success, elapsed };
