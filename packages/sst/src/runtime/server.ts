@@ -102,28 +102,6 @@ export const useRuntimeServer = lazy(async () => {
     }
   );
 
-  // Worker ready notification - indicates handler import complete
-  app.post<{ workerID: string }>(
-    `/:workerID/${cfg.API_VERSION}/runtime/init/ready`,
-    express.json({
-      strict: false,
-      type: ["application/json", "application/*+json"],
-      limit: "1mb",
-    }),
-    async (req, res) => {
-      const workerID = req.params.workerID;
-      console.log(`[server] Worker ${workerID.slice(0, 8)} ready, import time: ${req.body?.importTimeMs}ms`);
-
-      bus.publish("worker.ready", {
-        workerID,
-        importTimeMs: req.body?.importTimeMs || 0,
-        monoBuild: req.body?.monoBuild || false,
-      });
-
-      res.json("ok");
-    }
-  );
-
   app.get<{ functionID: string; workerID: string }>(
     `/:workerID/${cfg.API_VERSION}/runtime/invocation/next`,
     async (req, res) => {
