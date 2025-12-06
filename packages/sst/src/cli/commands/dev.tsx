@@ -468,7 +468,7 @@ export const dev = (program: Program) =>
         // This creates workers through the real request flow
         import("../../runtime/workers.js").then(async (mod) => {
           const workers = await mod.useRuntimeWorkers();
-          await workers.triggerWarmup(15);
+          await workers.triggerWarmup(30);
         });
       } catch (e: any) {
         await exitWithError(e);

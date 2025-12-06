@@ -772,8 +772,7 @@ export const useRuntimeWorkers = lazy(async () => {
 
       // Check if this is a preWarm worker (started but not yet active)
       if (startedWorkers.has(workerID)) {
-        // During preWarm, log directly since there's no request context
-        console.log(`[worker:${workerID.slice(0, 8)}] ${message.trim()}`);
+        // During preWarm, ignore output since there's no request context
         return;
       }
 
@@ -886,7 +885,6 @@ export const useRuntimeWorkers = lazy(async () => {
         logPool("WARMUP_SKIP", {
           reason: "no nodejs function found",
         });
-        console.log(`\x1b[33m⚡ Warmup: Skipped (no nodejs function found)\x1b[0m`);
         return { warmed: 0 };
       }
 
@@ -897,8 +895,6 @@ export const useRuntimeWorkers = lazy(async () => {
         functionName,
       });
 
-      console.log(`\x1b[36m⚡ Warming up ${count} workers via Lambda invocations...\x1b[0m`);
-
       const startTime = Date.now();
       let success = 0;
       let failed = 0;
@@ -908,7 +904,6 @@ export const useRuntimeWorkers = lazy(async () => {
       const lambda = new LambdaClient({});
 
       // Phase 1: Invoke first warmup to populate V8 compile cache
-      console.log(`\x1b[36m⚡ Warmup: Phase 1 - First worker (populates V8 cache)...\x1b[0m`);
       try {
         const result = await lambda.send(
           new InvokeCommand({
@@ -923,20 +918,15 @@ export const useRuntimeWorkers = lazy(async () => {
         );
         if (result.StatusCode === 200) {
           success++;
-          const firstTime = Date.now() - startTime;
-          console.log(`\x1b[36m⚡ Warmup: First worker ready in ${firstTime}ms\x1b[0m`);
         } else {
           failed++;
-          console.log(`\x1b[33m⚡ Warmup: First worker failed (status ${result.StatusCode})\x1b[0m`);
         }
       } catch (ex: any) {
         failed++;
-        console.log(`\x1b[33m⚡ Warmup: First worker error: ${ex.message}\x1b[0m`);
       }
 
       // Phase 2: Invoke remaining warmups in parallel
       if (count > 1) {
-        console.log(`\x1b[36m⚡ Warmup: Phase 2 - ${count - 1} workers in parallel...\x1b[0m`);
         const results = await Promise.all(
           Array.from({ length: count - 1 }, (_, i) => i + 1).map(async (i) => {
             try {
@@ -971,12 +961,6 @@ export const useRuntimeWorkers = lazy(async () => {
         elapsedMs: elapsed,
         avgMs: success > 0 ? Math.round(elapsed / success) : 0,
       });
-
-      if (failed === 0) {
-        console.log(`\x1b[32m⚡ Warmup complete: ${success} workers ready (${(elapsed / 1000).toFixed(1)}s)\x1b[0m`);
-      } else {
-        console.log(`\x1b[33m⚡ Warmup complete: ${success}/${count} workers ready, ${failed} failed (${(elapsed / 1000).toFixed(1)}s)\x1b[0m`);
-      }
 
       return { warmed: success, elapsed };
     },
