@@ -524,8 +524,10 @@ export const useRuntimeWorkers = lazy(async () => {
     const startTime = Date.now();
 
     // Check if this is a warmup request - force-create new workers for these
-    const isWarmupRequest = event && typeof event === 'object' && (event as any).__sst_warmup === true;
-    const warmupId = isWarmupRequest ? (event as any).warmupId : undefined;
+    // Matches the warmer format: { ding: true } or { warmer: true }
+    const isWarmupRequest = event && typeof event === 'object' &&
+      ('ding' in (event as any) || 'warmer' in (event as any) || (event as any).__sst_warmup === true);
+    const warmupId = isWarmupRequest ? ((event as any).warmupId ?? (event as any).index) : undefined;
 
     if (isWarmupRequest) {
       logInvokeTrace("WARMUP_RECEIVED", requestID, `warmupId=${warmupId}`);
@@ -913,8 +915,9 @@ export const useRuntimeWorkers = lazy(async () => {
             FunctionName: functionName,
             InvocationType: "RequestResponse",
             Payload: JSON.stringify({
-              __sst_warmup: true,
-              warmupId: 0,
+              ding: true,
+              concurrency: count,
+              index: 0,
             }),
           })
         );
@@ -942,8 +945,9 @@ export const useRuntimeWorkers = lazy(async () => {
                   FunctionName: functionName,
                   InvocationType: "RequestResponse",
                   Payload: JSON.stringify({
-                    __sst_warmup: true,
-                    warmupId: i,
+                    ding: true,
+                    concurrency: count,
+                    index: i,
                   }),
                 })
               );
