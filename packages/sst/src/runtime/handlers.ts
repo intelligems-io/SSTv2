@@ -16,6 +16,7 @@ import {usePythonHandler} from "./handlers/python.js";
 import {useRustHandler} from "./handlers/rust.js";
 import {lazy} from "../util/lazy.js";
 import {Semaphore} from "../util/semaphore.js";
+import {isMonoBuildEnabled, isMonoBuildPath} from "./mono-build-config.js";
 
 declare module "../bus.js" {
   export interface Events {
@@ -48,6 +49,8 @@ export interface StartWorkerInput {
   out: string;
   handler: string;
   runtime: string;
+  /** Whether this worker is using mono build mode */
+  isMonoBuild?: boolean;
 }
 
 interface ShouldBuildInput {
@@ -245,7 +248,7 @@ export const useFunctionBuilder = lazy(() => {
         // Optimization: For mono-build, the artifact path is stable and build is handled externally.
         // We can skip the potentially expensive shouldBuild check and rebuild call.
         const existing = artifacts.get(functionID);
-        if (existing?.out.includes(".mono-build")) continue;
+        if (existing && isMonoBuildPath(existing.out)) continue;
 
         const handler = handlers.for(info.runtime!);
         if (

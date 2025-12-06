@@ -17,6 +17,7 @@ import {
   setFunctionNameResolver,
   writeSessionEndSummary,
 } from "./worker-pool-logging.js";
+import {useMonoBuildConfig, isMonoBuildPath} from "./mono-build-config.js";
 
 declare module "../bus.js" {
   export interface Events {
@@ -80,7 +81,7 @@ process.on("exit", () => {
 
 // Get bundle rebuild timestamp for staleness checking
 function getBundleMtime(buildOut: string): number | undefined {
-  if (buildOut.includes(".mono-build")) {
+  if (isMonoBuildPath(buildOut)) {
     if (bundleMtimes.has(buildOut)) {
       return bundleMtimes.get(buildOut);
     }
@@ -132,11 +133,8 @@ function getPoolKey(
   runtime: string,
   buildOut: string
 ): { key: string; isShared: boolean } {
-  const isMonoBuild = buildOut.includes(".mono-build");
-  if (isMonoBuild) {
-    return { key: `${runtime}:mono-build`, isShared: true };
-  }
-  return { key: `${runtime}:${functionID}`, isShared: false };
+  // Use the global mono build config for pool key calculation
+  return useMonoBuildConfig().getPoolKey(functionID, runtime, buildOut);
 }
 
 // Extract readable function name from handler path
@@ -428,9 +426,9 @@ export const useRuntimeWorkers = lazy(async () => {
     const props = useFunctions().fromID(functionID);
     if (!props) return;
 
-    // Get build to check if mono-build
+    // Get build to check if mono-build using global config
     const build = await builder.artifact(functionID);
-    const isMonoBuild = build?.out.includes(".mono-build") ?? false;
+    const isMonoBuild = build ? isMonoBuildPath(build.out) : false;
 
     if (isMonoBuild) {
       // For mono-build: clear the entire shared pool since all functions share the same bundle
@@ -637,6 +635,7 @@ export const useRuntimeWorkers = lazy(async () => {
             environment: env,
             url: `${serverConfig.url}/${pooledWorker.pooledWorkerID}/${serverConfig.API_VERSION}`,
             runtime: props.runtime!,
+            isMonoBuild: isShared,
           });
           startedWorkers.add(pooledWorker.pooledWorkerID);
           logInvokeTrace("WORKER_STARTED", requestID);
@@ -691,6 +690,7 @@ export const useRuntimeWorkers = lazy(async () => {
           environment: env,
           url: `${serverConfig.url}/${awsWorkerID}/${serverConfig.API_VERSION}`,
           runtime: props.runtime!,
+          isMonoBuild: isMonoBuildPath(build.out),
         });
   
         workers.set(awsWorkerID, {workerID: awsWorkerID, functionID});

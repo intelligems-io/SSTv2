@@ -9,9 +9,9 @@ import { Context as LambdaContext } from "aws-lambda";
 
 const input = workerData;
 
-// Check for mono-bundle mode: if handler is "index.handler" and index.mjs exists in out directory
+// Check for mono-bundle mode: use the flag passed from parent process, fallback to file check
 const monoBundlePath = path.join(input.out, "index.mjs");
-const useMonoBundle = input.handler === "index.handler" && fs.existsSync(monoBundlePath);
+const useMonoBundle = input.isMonoBuild ?? (input.handler === "index.handler" && fs.existsSync(monoBundlePath));
 
 let file: string;
 let handlerName: string;
