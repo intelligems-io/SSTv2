@@ -536,7 +536,7 @@ export const useRuntimeWorkers = lazy(async () => {
     }
 
     // Send ack immediately
-    bus.publish("function.ack", {functionID, workerID: awsWorkerID});
+    bus.publish("function.ack", {functionID, workerID: awsWorkerID, requestID});
     logInvokeTrace("ACK_PUBLISHED", requestID, `elapsed=${Date.now() - startTime}ms`);
 
     const props = useFunctions().fromID(functionID);
