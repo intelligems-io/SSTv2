@@ -5,6 +5,7 @@ declare module "../bus.js" {
     "function.ack": {
       workerID: string;
       functionID: string;
+      requestID: string;
     };
     "function.invoked": {
       workerID: string;
