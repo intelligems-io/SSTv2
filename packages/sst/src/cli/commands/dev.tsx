@@ -464,10 +464,11 @@ export const dev = (program: Program) =>
           useFunctionLogger(),
         ]);
 
-        // Pre-warm workers for mono-build mode to avoid cold starts
+        // Trigger warmup by invoking Lambda functions with warmup payloads
+        // This creates workers through the real request flow
         import("../../runtime/workers.js").then(async (mod) => {
           const workers = await mod.useRuntimeWorkers();
-          await workers.preWarm(15);
+          await workers.triggerWarmup(15);
         });
       } catch (e: any) {
         await exitWithError(e);

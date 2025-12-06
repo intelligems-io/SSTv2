@@ -11,15 +11,10 @@ import { Context as LambdaContext } from "aws-lambda";
 // Enable V8 compile cache for faster subsequent worker starts (Node.js 22+)
 // First worker compiles and caches bytecode, subsequent workers load from cache
 try {
-  debugger;
   const mod = await import("node:module");
   if (typeof mod.enableCompileCache === "function") {
-    // Node.js 22.8+ - use the API directly
     const cacheDir = path.join(os.tmpdir(), "sst-compile-cache");
-    const result = mod.enableCompileCache(cacheDir);
-    if (result.status === 0) {
-      console.log(`[worker] V8 compile cache enabled: ${result.directory}`);
-    }
+    mod.enableCompileCache(cacheDir);
   }
 } catch {
   // Node.js < 22.8 or compile cache not available - continue without it
@@ -93,8 +88,6 @@ function fetch(req: {
   });
 }
 
-const importStart = Date.now();
-console.log(`[worker] Starting import of ${file}...`);
 try {
   const { href } = url.pathToFileURL(file);
   const mod = await import(href);
@@ -106,32 +99,12 @@ try {
         : `Function "${handlerName}" not found in "${input.handler}". Found: ${Object.keys(mod).join(", ")}`
     );
   }
-  // if (!mod) mod = require(file);
 
   // For mono-bundle: eagerly load one handler to warm the shared chunks
   // This triggers loading of the 35MB+ shared chunks that are lazy-loaded
   if (useMonoBundle && mod.warmUp) {
-    console.log(`[worker] Warming up shared chunks...`);
-    const warmStart = Date.now();
     await mod.warmUp();
-    console.log(`[worker] Warm-up complete in ${Date.now() - warmStart}ms`);
   }
-
-  // Notify that worker is ready (import complete)
-  const importTime = Date.now() - importStart;
-  console.log(`[worker] Import complete in ${importTime}ms, notifying server...`);
-  await fetch({
-    path: `/runtime/init/ready`,
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      importTimeMs: importTime,
-      monoBuild: useMonoBundle,
-    }),
-  });
-  console.log(`[worker] Ready notification sent`);
 } catch (ex: any) {
   await fetch({
     path: `/runtime/init/error`,
