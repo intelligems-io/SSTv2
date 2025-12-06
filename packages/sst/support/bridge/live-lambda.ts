@@ -90,6 +90,20 @@ const fragments = new Map<string, Map<number, Fragment>>();
 
 let onMessage: (evt: any) => void;
 
+// Helper to extract request path from event for logging
+function getRequestPath(event: any): string {
+  if (!event || typeof event !== 'object') return 'unknown';
+  // API Gateway v2 (HTTP API)
+  if (event.rawPath) return event.rawPath;
+  // API Gateway v1 (REST API)
+  if (event.path) return event.path;
+  // ALB
+  if (event.requestContext?.path) return event.requestContext.path;
+  // Warmup request
+  if (event.ding || event.warmer || event.__sst_warmup) return '[warmup]';
+  return 'unknown';
+}
+
 device.on("message", async (_topic, buffer: Buffer) => {
   const fragment = JSON.parse(buffer.toString()) as Fragment;
   console.log("Got fragment", fragment.id, fragment.index);
@@ -132,15 +146,24 @@ device.on("message", async (_topic, buffer: Buffer) => {
 });
 
 export async function handler(event: any, context: any) {
+  const requestID = context.awsRequestId;
+  const requestPath = getRequestPath(event);
+  const startTime = Date.now();
+
+  console.log(`[BRIDGE] path=${requestPath} reqId=${requestID.slice(0, 8)} START`);
+
   if (!isConnected) {
-    console.log("Waiting for IoT connection...");
+    console.log(`[BRIDGE] path=${requestPath} reqId=${requestID.slice(0, 8)} Waiting for IoT connection...`);
     await new Promise<void>((resolve) => {
       device.once("connect", () => resolve());
     });
   }
 
   const result = await new Promise<any>((r) => {
+    let ackReceived = false;
+
     const timeout = setTimeout(() => {
+      console.log(`[BRIDGE] path=${requestPath} reqId=${requestID.slice(0, 8)} TIMEOUT after ${Date.now() - startTime}ms ackReceived=${ackReceived}`);
       r({
         type: "function.timeout",
       });
@@ -148,21 +171,27 @@ export async function handler(event: any, context: any) {
     onMessage = (evt) => {
       if (evt.type === "function.ack") {
         if (evt.properties.workerID === workerID) {
+          ackReceived = true;
+          console.log(`[BRIDGE] path=${requestPath} reqId=${requestID.slice(0, 8)} ACK received after ${Date.now() - startTime}ms`);
           clearTimeout(timeout);
         }
       }
       if (["function.success", "function.error"].includes(evt.type)) {
         if (evt.properties.workerID === workerID) {
           clearTimeout(timeout);
+          console.log(`[BRIDGE] path=${requestPath} reqId=${requestID.slice(0, 8)} ${evt.type} after ${Date.now() - startTime}ms`);
           r(evt);
         }
       }
     };
+
+    console.log(`[BRIDGE] path=${requestPath} reqId=${requestID.slice(0, 8)} Publishing function.invoked`);
+
     for (const fragment of encode({
       type: "function.invoked",
       properties: {
         workerID: workerID,
-        requestID: context.awsRequestId,
+        requestID: requestID,
         functionID: process.env.SST_FUNCTION_ID,
         deadline: context.getRemainingTimeInMillis(),
         event,
@@ -174,7 +203,7 @@ export async function handler(event: any, context: any) {
     }
   });
 
-  console.log("Got result", result.type);
+  console.log(`[BRIDGE] path=${requestPath} reqId=${requestID.slice(0, 8)} Got result=${result.type} total=${Date.now() - startTime}ms`);
 
   if (result.type === "function.timeout")
     return {

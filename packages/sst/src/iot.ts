@@ -145,6 +145,8 @@ export const useIOT = lazy(async () => {
   device.on("message", (_topic, buffer: Buffer) => {
     const fragment = JSON.parse(buffer.toString());
     if (!fragment.id) {
+      const requestID = fragment.properties?.requestID;
+      console.log(`[IOT-RX] Received ${fragment.type} reqId=${requestID?.slice(0, 8) || 'N/A'}`);
       bus.publish(fragment.type, fragment.properties);
       return;
     }
@@ -164,6 +166,8 @@ export const useIOT = lazy(async () => {
       fragments.delete(fragment.id);
       const evt = JSON.parse(data) as EventPayload;
       if (evt.sourceID === bus.sourceID) return;
+      const requestID = (evt.properties as any)?.requestID;
+      console.log(`[IOT-RX] Received ${evt.type} reqId=${requestID?.slice(0, 8) || 'N/A'} (${fragment.count} fragments)`);
       bus.publish(evt.type, evt.properties);
     }
   });

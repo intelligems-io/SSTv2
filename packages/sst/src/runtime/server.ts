@@ -2,9 +2,11 @@ import express from "express";
 import { Events, useBus } from "../bus.js";
 import { Logger } from "../logger.js";
 import { useRuntimeWorkers } from "./workers.js";
+import { useFunctions } from "../constructs/Function.js";
 import https from "https";
 import getPort from "get-port";
 import { lazy } from "../util/lazy.js";
+import { getRequestPath } from "./request-utils.js";
 
 export const useRuntimeServerConfig = lazy(async () => {
   const port = await getPort({
@@ -44,9 +46,13 @@ export const useRuntimeServer = lazy(async () => {
     targetWorkerID: string,
     invocation: Events["function.invoked"]
   ) {
+    const requestPath = getRequestPath(invocation.event);
+    const requestID = invocation.requestID;
+
     const waiting = workersWaiting.get(targetWorkerID);
     if (waiting) {
       workersWaiting.delete(targetWorkerID);
+      console.log(`[SERVER] path=${requestPath} reqId=${requestID.slice(0, 8)} Worker ${targetWorkerID.slice(0, 8)} was waiting, delivering immediately`);
       waiting(invocation);
       return;
     }
@@ -57,6 +63,7 @@ export const useRuntimeServer = lazy(async () => {
       invocationsQueued.set(targetWorkerID, arr);
     }
     arr.push(invocation);
+    console.log(`[SERVER] path=${requestPath} reqId=${requestID.slice(0, 8)} Worker ${targetWorkerID.slice(0, 8)} not waiting, QUEUED (queueSize=${arr.length})`);
   }
 
   workers.subscribe("worker.exited", async (evt) => {
@@ -105,15 +112,26 @@ export const useRuntimeServer = lazy(async () => {
   app.get<{ functionID: string; workerID: string }>(
     `/:workerID/${cfg.API_VERSION}/runtime/invocation/next`,
     async (req, res) => {
+      const workerID = req.params.workerID;
+      console.log(`[SERVER] Worker ${workerID.slice(0, 8)} requesting /next`);
       Logger.debug(
         "Worker",
-        req.params.workerID,
+        workerID,
         "is waiting for next invocation"
       );
-      const payload = await next(req.params.workerID);
-      Logger.debug("Worker", req.params.workerID, "sending next payload");
+      const waitStart = Date.now();
+      const payload = await next(workerID);
+      const requestPath = getRequestPath(payload.event);
+      const requestID = payload.context.awsRequestId;
+      console.log(`[SERVER] path=${requestPath} reqId=${requestID.slice(0, 8)} Worker ${workerID.slice(0, 8)} received payload after waiting ${Date.now() - waitStart}ms`);
+      Logger.debug("Worker", workerID, "sending next payload");
+
+      // Get function properties for per-invocation context
+      // This is essential for mono-build shared workers that serve multiple functions
+      const funcProps = useFunctions().fromID(payload.functionID);
+
       res.set({
-        "Lambda-Runtime-Aws-Request-Id": payload.context.awsRequestId,
+        "Lambda-Runtime-Aws-Request-Id": requestID,
         "Lambda-Runtime-Deadline-Ms": Date.now() + payload.deadline,
         "Lambda-Runtime-Invoked-Function-Arn":
           payload.context.invokedFunctionArn,
@@ -151,10 +169,13 @@ export const useRuntimeServer = lazy(async () => {
     }),
     (req, res) => {
       const pooledWorkerID = req.params.workerID;
+      const requestID = req.params.awsRequestId;
+      console.log(`[SERVER] reqId=${requestID.slice(0, 8)} Worker ${pooledWorkerID.slice(0, 8)} posting /response`);
       Logger.debug("Worker", pooledWorkerID, "got response", req.body);
 
       const worker = workers.fromID(pooledWorkerID);
       if (!worker) {
+        console.log(`[SERVER] reqId=${requestID.slice(0, 8)} ERROR: Worker ${pooledWorkerID.slice(0, 8)} not found`);
         res.status(404).send();
         return;
       }
@@ -164,10 +185,11 @@ export const useRuntimeServer = lazy(async () => {
         ? workers.getAwsWorkerID(pooledWorkerID) || pooledWorkerID
         : pooledWorkerID;
 
+      console.log(`[SERVER] reqId=${requestID.slice(0, 8)} Publishing function.success awsWorkerID=${awsWorkerID.slice(0, 8)}`);
       bus.publish("function.success", {
         workerID: awsWorkerID,
         functionID: worker.functionID,
-        requestID: req.params.awsRequestId,
+        requestID: requestID,
         body: req.body,
       });
 
