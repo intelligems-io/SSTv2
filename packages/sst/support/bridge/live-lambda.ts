@@ -148,6 +148,9 @@ export async function handler(event: any, context: any) {
     onMessage = (evt) => {
       if (evt.type === "function.ack") {
         if (evt.properties.workerID === workerID) {
+          // Clear the timeout once we receive ACK - this means the local dev server
+          // received the request and is processing it. The function can now take
+          // as long as it needs (up to Lambda's own deadline).
           clearTimeout(timeout);
         }
       }
