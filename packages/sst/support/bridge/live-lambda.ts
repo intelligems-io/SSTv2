@@ -144,7 +144,7 @@ export async function handler(event: any, context: any) {
       r({
         type: "function.timeout",
       });
-    }, 5 * 1000);
+    }, 25 * 1000);
     onMessage = (evt) => {
       if (evt.type === "function.ack") {
         if (evt.properties.workerID === workerID) {

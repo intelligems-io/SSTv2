@@ -3,9 +3,22 @@ import path from "path";
 import fs from "fs";
 import http from "http";
 import url from "url";
+import os from "os";
 import { Context as LambdaContext } from "aws-lambda";
 // import { createRequire } from "module";
 // global.require = createRequire(import.meta.url);
+
+// Enable V8 compile cache for faster subsequent worker starts (Node.js 22+)
+// First worker compiles and caches bytecode, subsequent workers load from cache
+try {
+  const mod = await import("node:module");
+  if (typeof mod.enableCompileCache === "function") {
+    const cacheDir = path.join(os.tmpdir(), "sst-compile-cache");
+    mod.enableCompileCache(cacheDir);
+  }
+} catch {
+  // Node.js < 22.8 or compile cache not available - continue without it
+}
 
 const input = workerData;
 
@@ -86,7 +99,12 @@ try {
         : `Function "${handlerName}" not found in "${input.handler}". Found: ${Object.keys(mod).join(", ")}`
     );
   }
-  // if (!mod) mod = require(file);
+
+  // For mono-bundle: eagerly load one handler to warm the shared chunks
+  // This triggers loading of the 35MB+ shared chunks that are lazy-loaded
+  if (useMonoBundle && mod.warmUp) {
+    await mod.warmUp();
+  }
 } catch (ex: any) {
   await fetch({
     path: `/runtime/init/error`,

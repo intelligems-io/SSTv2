@@ -463,6 +463,13 @@ export const dev = (program: Program) =>
           import("./plugins/warmer.js").then((mod) => mod.useRDSWarmer()),
           useFunctionLogger(),
         ]);
+
+        // Trigger warmup by invoking Lambda functions with warmup payloads
+        // This creates workers through the real request flow
+        import("../../runtime/workers.js").then(async (mod) => {
+          const workers = await mod.useRuntimeWorkers();
+          await workers.triggerWarmup(15);
+        });
       } catch (e: any) {
         await exitWithError(e);
       }

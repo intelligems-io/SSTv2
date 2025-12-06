@@ -17,6 +17,11 @@ import {useRustHandler} from "./handlers/rust.js";
 import {lazy} from "../util/lazy.js";
 import {Semaphore} from "../util/semaphore.js";
 
+// Build concurrency semaphore - only used for actual builds, not mono-build lookups
+const buildSemaphore = new Semaphore(
+  parseInt(process.env.SST_BUILD_CONCURRENCY || "4", 10)
+);
+
 declare module "../bus.js" {
   export interface Events {
     "function.build.started": {
@@ -100,13 +105,11 @@ export const useRuntimeHandlers = lazy(() => {
       return result;
     },
     async build(functionID: string, mode: BuildInput["mode"]) {
-      async function task() {
+      // Fast path for mono-bundle: check without semaphore since no actual build work
+      async function tryMonoBundleFastPath() {
         const func = useFunctions().fromID(functionID);
-        if (!func)
-          return {
-            type: "error" as const,
-            errors: [`Function with ID "${functionID}" not found`],
-          };
+        if (!func) return null;
+
         const handler = result.for(func.runtime!);
         const out = path.join(project.paths.artifacts, functionID);
 
@@ -131,61 +134,92 @@ export const useRuntimeHandlers = lazy(() => {
           };
         }
 
-        // Non-mono-bundle: follow original flow
-        await fs.rm(out, {recursive: true, force: true});
-        await fs.mkdir(out, {recursive: true});
+        return null; // Not mono-bundle, need full build
+      }
 
-        bus.publish("function.build.started", {functionID});
+      // Full build with semaphore protection for actual compilation work
+      async function fullBuild() {
+        const func = useFunctions().fromID(functionID);
+        if (!func)
+          return {
+            type: "error" as const,
+            errors: [`Function with ID "${functionID}" not found`],
+          };
+        const handler = result.for(func.runtime!);
+        const out = path.join(project.paths.artifacts, functionID);
 
-        if (func.hooks?.beforeBuild) await func.hooks.beforeBuild(func, out);
-        const built = await handler!.build({
-          functionID,
-          out,
-          mode,
-          props: func,
-        });
-        if (built.type === "error") {
-          bus.publish("function.build.failed", {
+        // Acquire semaphore only for actual build work
+        const unlock = await buildSemaphore.lock();
+        try {
+          // Non-mono-bundle: follow original flow
+          await fs.rm(out, {recursive: true, force: true});
+          await fs.mkdir(out, {recursive: true});
+
+          bus.publish("function.build.started", {functionID});
+
+          if (func.hooks?.beforeBuild) await func.hooks.beforeBuild(func, out);
+          const built = await handler!.build({
             functionID,
-            errors: built.errors,
+            out,
+            mode,
+            props: func,
           });
-          return built;
-        }
-        if (func.copyFiles) {
-          await Promise.all(
-            func.copyFiles.map(async (entry) => {
-              const fromPath = path.join(project.paths.root, entry.from);
-              const to = entry.to || entry.from;
-              if (path.isAbsolute(to))
-                throw new Error(
-                  `Copy destination path "${to}" must be relative`
-                );
-              const toPath = path.join(out, to);
-              if (mode === "deploy")
-                await fs.cp(fromPath, toPath, {
-                  recursive: true,
-                });
-              if (mode === "start") {
-                try {
-                  const dir = path.dirname(toPath);
-                  await fs.mkdir(dir, {recursive: true});
-                  await fs.symlink(fromPath, toPath);
-                } catch (ex) {
-                  Logger.debug("Failed to symlink", fromPath, toPath, ex);
+          if (built.type === "error") {
+            bus.publish("function.build.failed", {
+              functionID,
+              errors: built.errors,
+            });
+            return built;
+          }
+          if (func.copyFiles) {
+            await Promise.all(
+              func.copyFiles.map(async (entry) => {
+                const fromPath = path.join(project.paths.root, entry.from);
+                const to = entry.to || entry.from;
+                if (path.isAbsolute(to))
+                  throw new Error(
+                    `Copy destination path "${to}" must be relative`
+                  );
+                const toPath = path.join(out, to);
+                if (mode === "deploy")
+                  await fs.cp(fromPath, toPath, {
+                    recursive: true,
+                  });
+                if (mode === "start") {
+                  try {
+                    const dir = path.dirname(toPath);
+                    await fs.mkdir(dir, {recursive: true});
+                    await fs.symlink(fromPath, toPath);
+                  } catch (ex) {
+                    Logger.debug("Failed to symlink", fromPath, toPath, ex);
+                  }
                 }
-              }
-            })
-          );
+              })
+            );
+          }
+
+          if (func.hooks?.afterBuild) await func.hooks.afterBuild(func, out);
+
+          bus.publish("function.build.success", {functionID});
+          return {
+            ...built,
+            out,
+            sourcemap: built.sourcemap,
+          };
+        } finally {
+          unlock();
+        }
+      }
+
+      async function task() {
+        // Try mono-bundle fast path first (no semaphore needed)
+        const monoBundleResult = await tryMonoBundleFastPath();
+        if (monoBundleResult) {
+          return monoBundleResult;
         }
 
-        if (func.hooks?.afterBuild) await func.hooks.afterBuild(func, out);
-
-        bus.publish("function.build.success", {functionID});
-        return {
-          ...built,
-          out,
-          sourcemap: built.sourcemap,
-        };
+        // Fall back to full build with semaphore protection
+        return fullBuild();
       }
 
       if (pendingBuilds.has(functionID)) {
@@ -214,26 +248,42 @@ interface Artifact {
 export const useFunctionBuilder = lazy(() => {
   const artifacts = new Map<string, Artifact>();
   const handlers = useRuntimeHandlers();
-  const semaphore = new Semaphore(
-    parseInt(process.env.SST_BUILD_CONCURRENCY || "4", 10)
-  );
+
+  // Track pending builds to prevent duplicate concurrent builds for same function
+  const pendingArtifactBuilds = new Map<string, Promise<Artifact | undefined>>();
 
   const result = {
     artifact: (functionID: string) => {
+      // Fast path: already cached - return immediately without any async work
       if (artifacts.has(functionID)) return artifacts.get(functionID)!;
       return result.build(functionID);
     },
-    build: async (functionID: string) => {
-      const unlock = await semaphore.lock();
-      try {
-        const result = await handlers.build(functionID, "start");
-        if (!result) return;
-        if (result.type === "error") return;
-        artifacts.set(functionID, result);
-        return artifacts.get(functionID)!;
-      } finally {
-        unlock();
-      }
+    build: async (functionID: string): Promise<Artifact | undefined> => {
+      // Fast path: already cached (check again in case of concurrent calls)
+      if (artifacts.has(functionID)) return artifacts.get(functionID)!;
+
+      // Deduplication: if build already in progress for this function, wait for it
+      const pending = pendingArtifactBuilds.get(functionID);
+      if (pending) return pending;
+
+      const buildTask = async (): Promise<Artifact | undefined> => {
+        try {
+          // handlers.build() handles semaphore internally:
+          // - mono-build: no semaphore (fast path)
+          // - non-mono-build: semaphore protected
+          const buildResult = await handlers.build(functionID, "start");
+          if (!buildResult) return;
+          if (buildResult.type === "error") return;
+          artifacts.set(functionID, buildResult);
+          return artifacts.get(functionID)!;
+        } finally {
+          pendingArtifactBuilds.delete(functionID);
+        }
+      };
+
+      const promise = buildTask();
+      pendingArtifactBuilds.set(functionID, promise);
+      return promise;
     },
   };
 

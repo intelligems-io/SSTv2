@@ -518,10 +518,22 @@ export const useRuntimeWorkers = lazy(async () => {
       functionID,
       requestID,
       env,
+      event,
     } = evt.properties;
 
     const startTime = Date.now();
-    logInvokeTrace("INVOKE_RECEIVED", requestID, `func=${functionID.slice(-40)}`);
+
+    // Check if this is a warmup request - force-create new workers for these
+    // Matches the warmer format: { ding: true } or { warmer: true }
+    const isWarmupRequest = event && typeof event === 'object' &&
+      ('ding' in (event as any) || 'warmer' in (event as any) || (event as any).__sst_warmup === true);
+    const warmupId = isWarmupRequest ? ((event as any).warmupId ?? (event as any).index) : undefined;
+
+    if (isWarmupRequest) {
+      logInvokeTrace("WARMUP_RECEIVED", requestID, `warmupId=${warmupId}`);
+    } else {
+      logInvokeTrace("INVOKE_RECEIVED", requestID, `func=${functionID.slice(-40)}`);
+    }
 
     // Send ack immediately
     bus.publish("function.ack", {functionID, workerID: awsWorkerID});
@@ -583,7 +595,8 @@ export const useRuntimeWorkers = lazy(async () => {
         build.out
       );
 
-      let pooledWorker = getIdleWorker(poolKey, functionID, build.out);
+      // For warmup requests, always create new workers (never reuse from pool)
+      let pooledWorker = isWarmupRequest ? undefined : getIdleWorker(poolKey, functionID, build.out);
       let isReuse = false;
 
       if (pooledWorker) {
@@ -617,7 +630,7 @@ export const useRuntimeWorkers = lazy(async () => {
         // Start new worker with pooledWorkerID (cold start)
         trackRequestStart(functionID, false);
         const currentPoolSize = workerPool.get(poolKey)?.length || 0;
-        logPool("CREATE", {
+        logPool(isWarmupRequest ? "WARMUP_CREATE" : "CREATE", {
           pooledWorkerID: pooledWorker.pooledWorkerID.slice(0, 8),
           functionID,
           runtime: props.runtime,
@@ -626,6 +639,7 @@ export const useRuntimeWorkers = lazy(async () => {
           isSharedPool: isShared,
           currentPoolSize,
           activeWorkers: activeWorkers.size,
+          ...(isWarmupRequest && { warmupId }),
         });
 
         logInvokeTrace("WORKER_START", requestID, `pooled=${pooledWorker.pooledWorkerID.slice(0, 8)}`);
@@ -756,6 +770,13 @@ export const useRuntimeWorkers = lazy(async () => {
         return;
       }
 
+      // Check if this is a preWarm worker (started but not yet active)
+      if (startedWorkers.has(workerID)) {
+        // During preWarm, log directly since there's no request context
+        console.log(`[worker:${workerID.slice(0, 8)}] ${message.trim()}`);
+        return;
+      }
+
       // Non-pooled worker
       const worker = workers.get(workerID);
       if (!worker) return;
@@ -839,5 +860,126 @@ export const useRuntimeWorkers = lazy(async () => {
       "worker.stdout",
       "worker.reused"
     ),
+
+    /**
+     * Trigger warmup by invoking Lambda functions with warmup payloads.
+     * This sends real requests through the IoT bridge, which naturally creates workers.
+     * @param count Number of workers to warm up (default: 15)
+     */
+    async triggerWarmup(count: number = 15) {
+      const functions = useFunctions();
+      const allFunctions = functions.all;
+
+      // Find a nodejs function to use as the warmup target
+      let targetFunction: { id: string; props: any; functionName: string } | null = null;
+
+      for (const [id, props] of Object.entries(allFunctions)) {
+        if (!props.runtime?.startsWith("nodejs")) continue;
+        if (!isPoolableRuntime(props.runtime!)) continue;
+        if (!props.functionName) continue;
+
+        targetFunction = { id, props, functionName: props.functionName as string };
+        break;
+      }
+
+      if (!targetFunction) {
+        logPool("WARMUP_SKIP", {
+          reason: "no nodejs function found",
+        });
+        console.log(`\x1b[33m⚡ Warmup: Skipped (no nodejs function found)\x1b[0m`);
+        return { warmed: 0 };
+      }
+
+      const { functionName } = targetFunction;
+
+      logPool("WARMUP_START", {
+        count,
+        functionName,
+      });
+
+      console.log(`\x1b[36m⚡ Warming up ${count} workers via Lambda invocations...\x1b[0m`);
+
+      const startTime = Date.now();
+      let success = 0;
+      let failed = 0;
+
+      // Use the shared AWS client
+      const { useAWSClient } = await import("../credentials.js");
+      const { LambdaClient, InvokeCommand } = await import("@aws-sdk/client-lambda");
+      const lambda = useAWSClient(LambdaClient);
+
+      // Phase 1: Invoke first warmup to populate V8 compile cache
+      console.log(`\x1b[36m⚡ Warmup: Phase 1 - First worker (populates V8 cache)...\x1b[0m`);
+      try {
+        const result = await lambda.send(
+          new InvokeCommand({
+            FunctionName: functionName,
+            InvocationType: "RequestResponse",
+            Payload: JSON.stringify({
+              ding: true,
+              concurrency: count,
+              index: 0,
+            }),
+          })
+        );
+        if (result.StatusCode === 200) {
+          success++;
+          const firstTime = Date.now() - startTime;
+          console.log(`\x1b[36m⚡ Warmup: First worker ready in ${firstTime}ms\x1b[0m`);
+        } else {
+          failed++;
+          console.log(`\x1b[33m⚡ Warmup: First worker failed (status ${result.StatusCode})\x1b[0m`);
+        }
+      } catch (ex: any) {
+        failed++;
+        console.log(`\x1b[33m⚡ Warmup: First worker error: ${ex.message}\x1b[0m`);
+      }
+
+      // Phase 2: Invoke remaining warmups in parallel
+      if (count > 1) {
+        console.log(`\x1b[36m⚡ Warmup: Phase 2 - ${count - 1} workers in parallel...\x1b[0m`);
+        const results = await Promise.all(
+          Array.from({ length: count - 1 }, (_, i) => i + 1).map(async (i) => {
+            try {
+              const result = await lambda.send(
+                new InvokeCommand({
+                  FunctionName: functionName,
+                  InvocationType: "RequestResponse",
+                  Payload: JSON.stringify({
+                    ding: true,
+                    concurrency: count,
+                    index: i,
+                  }),
+                })
+              );
+              return result.StatusCode === 200;
+            } catch {
+              return false;
+            }
+          })
+        );
+
+        for (const ok of results) {
+          if (ok) success++;
+          else failed++;
+        }
+      }
+
+      const elapsed = Date.now() - startTime;
+      logPool("WARMUP_DONE", {
+        success,
+        failed,
+        elapsedMs: elapsed,
+        avgMs: success > 0 ? Math.round(elapsed / success) : 0,
+      });
+
+      if (failed === 0) {
+        console.log(`\x1b[32m⚡ Warmup complete: ${success} workers ready (${(elapsed / 1000).toFixed(1)}s)\x1b[0m`);
+      } else {
+        console.log(`\x1b[33m⚡ Warmup complete: ${success}/${count} workers ready, ${failed} failed (${(elapsed / 1000).toFixed(1)}s)\x1b[0m`);
+      }
+
+      return { warmed: success, elapsed };
+    },
   };
 });
