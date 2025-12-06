@@ -1,6 +1,6 @@
-import type { CloudAssembly } from "aws-cdk-lib/cx-api";
-import type { Program } from "../program.js";
-import { VisibleError } from "../../error.js";
+import type {CloudAssembly} from "aws-cdk-lib/cx-api";
+import type {Program} from "../program.js";
+import {VisibleError} from "../../error.js";
 
 export const dev = (program: Program) =>
   program.command(
@@ -12,26 +12,26 @@ export const dev = (program: Program) =>
         description: "Increase function timeout",
       }),
     async (args) => {
-      const { Logger } = await import("../../logger.js");
-      const { Colors } = await import("../colors.js");
-      const { printHeader } = await import("../ui/header.js");
-      const { mapValues } = await import("remeda");
+      const {Logger} = await import("../../logger.js");
+      const {Colors} = await import("../colors.js");
+      const {printHeader} = await import("../ui/header.js");
+      const {mapValues} = await import("remeda");
       const path = await import("path");
-      const { useBus } = await import("../../bus.js");
-      const { useWatcher } = await import("../../watcher.js");
-      const { exit, exitWithError, trackDevError, trackDevRunning } =
+      const {useBus} = await import("../../bus.js");
+      const {useWatcher} = await import("../../watcher.js");
+      const {exit, exitWithError, trackDevError, trackDevRunning} =
         await import("../program.js");
-      const { createSpinner } = await import("../spinner.js");
-      const { bold, dim, yellow } = await import("colorette");
-      const { useLocalServer } = await import("../local/server.js");
+      const {createSpinner} = await import("../spinner.js");
+      const {bold, dim, yellow} = await import("colorette");
+      const {useLocalServer} = await import("../local/server.js");
       const fs = await import("fs/promises");
       const crypto = await import("crypto");
-      const { useProject } = await import("../../project.js");
-      const { clear } = await import("../terminal.js");
-      const { getCiInfo } = await import("../ci-info.js");
-      const { useMetadataCache } = await import("../../stacks/metadata.js");
-      const { lazy } = await import("../../util/lazy.js");
-      const { useIOT, isSupported } = await import("../../iot.js");
+      const {useProject} = await import("../../project.js");
+      const {clear} = await import("../terminal.js");
+      const {getCiInfo} = await import("../ci-info.js");
+      const {useMetadataCache} = await import("../../stacks/metadata.js");
+      const {lazy} = await import("../../util/lazy.js");
+      const {useIOT, isSupported} = await import("../../iot.js");
 
       try {
         if (args._[0] === "start") {
@@ -53,7 +53,7 @@ export const dev = (program: Program) =>
         }
 
         const useFunctionLogger = lazy(async () => {
-          const { useFunctions } = await import("../../constructs/Function.js");
+          const {useFunctions} = await import("../../constructs/Function.js");
           const bus = useBus();
 
           const colors = ["#01cdfe", "#ff71ce", "#05ffa1", "#b967ff"];
@@ -64,7 +64,17 @@ export const dev = (program: Program) =>
             started: number;
             color: string;
           }
+
           const pending = new Map<string, Pending>();
+
+          // Track warmup request IDs to suppress their logs
+          const warmupRequestIDs = new Set<string>();
+
+          // Helper to check if an event payload is a warmup request
+          function isWarmupEvent(event: any): boolean {
+            return event && typeof event === 'object' &&
+              ('ding' in event || 'warmer' in event || event.__sst_warmup === true);
+          }
 
           function prefix(requestID: string): string {
             const exists = pending.get(requestID);
@@ -79,13 +89,51 @@ export const dev = (program: Program) =>
             index++;
             return prefix(requestID);
           }
+
           function end(requestID: string) {
             // index--;
             // if (index < 0) index = colors.length - 1;
             pending.delete(requestID);
+            warmupRequestIDs.delete(requestID);
           }
 
+          // Warmup progress bar state
+          let warmupSpinner: ReturnType<typeof createSpinner> | null = null;
+          let warmupTotal = 0;
+          let warmupCompleted = 0;
+
+          bus.subscribe("warmup.start", async (evt) => {
+            warmupTotal = evt.properties.count;
+            warmupCompleted = 0;
+            warmupSpinner = createSpinner({
+              color: "cyan",
+              text: Colors.dim(` Warming up workers... 0/${warmupTotal}`),
+            }).start();
+          });
+
+          bus.subscribe("warmup.progress", async (evt) => {
+            warmupCompleted = evt.properties.completed;
+            if (warmupSpinner) {
+              warmupSpinner.text = Colors.dim(` Warming up workers... ${warmupCompleted}/${warmupTotal}`);
+            }
+          });
+
+          bus.subscribe("warmup.complete", async (evt) => {
+            if (warmupSpinner) {
+              warmupSpinner.succeed(
+                Colors.dim(` Warmed up ${evt.properties.success} workers in ${evt.properties.elapsedMs}ms`)
+              );
+              warmupSpinner = null;
+            }
+          });
+
           bus.subscribe("function.invoked", async (evt) => {
+            // Check if this is a warmup request and track it
+            if (isWarmupEvent(evt.properties.event)) {
+              warmupRequestIDs.add(evt.properties.requestID);
+              return; // Don't log warmup invocations
+            }
+
             Colors.line(
               prefix(evt.properties.requestID),
               Colors.dim.bold("Invoked"),
@@ -96,9 +144,14 @@ export const dev = (program: Program) =>
           });
 
           bus.subscribe("worker.stdout", async (evt) => {
+            // Skip warmup request logs
+            if (warmupRequestIDs.has(evt.properties.requestID)) return;
+
             const info = useFunctions().fromID(evt.properties.functionID);
             prefix(evt.properties.requestID);
-            const { started } = pending.get(evt.properties.requestID)!;
+            const pendingReq = pending.get(evt.properties.requestID);
+            if (!pendingReq) return; // Safety check
+            const {started} = pendingReq;
             for (let line of evt.properties.message.split("\n")) {
               // Remove prefix from container logs
               if (info?.runtime === "container") {
@@ -135,10 +188,11 @@ export const dev = (program: Program) =>
             const info = useFunctions().fromID(evt.properties.functionID);
             if (!info) return;
             if (info.enableLiveDev === false) return;
+            const buildType = evt.properties.monoBundle ? "(mono-bundle)" : "(individual)";
             Colors.line(
               info.runtime === "container"
-                ? Colors.dim(Colors.prefix, "Built", info.handler!, "container")
-                : Colors.dim(Colors.prefix, "Built", info.handler!)
+                ? Colors.dim(Colors.prefix, "Built", info.handler!, "container", buildType)
+                : Colors.dim(Colors.prefix, "Built", info.handler!, buildType)
             );
           });
 
@@ -155,9 +209,16 @@ export const dev = (program: Program) =>
           });
 
           bus.subscribe("function.success", async (evt) => {
+            // Skip warmup request logs
+            if (warmupRequestIDs.has(evt.properties.requestID)) {
+              end(evt.properties.requestID);
+              return;
+            }
+
             // stdout logs sometimes come in after
             const p = prefix(evt.properties.requestID);
-            const req = pending.get(evt.properties.requestID)!;
+            const req = pending.get(evt.properties.requestID);
+            if (!req) return; // Safety check
             setTimeout(() => {
               Colors.line(
                 p,
@@ -168,6 +229,12 @@ export const dev = (program: Program) =>
           });
 
           bus.subscribe("function.error", async (evt) => {
+            // Skip warmup request logs
+            if (warmupRequestIDs.has(evt.properties.requestID)) {
+              end(evt.properties.requestID);
+              return;
+            }
+
             setTimeout(() => {
               Colors.line(
                 prefix(evt.properties.requestID),
@@ -186,10 +253,10 @@ export const dev = (program: Program) =>
 
         const useStackBuilder = lazy(async () => {
           const watcher = useWatcher();
-          const { printDeploymentResults, DeploymentUI } = await import(
+          const {printDeploymentResults, DeploymentUI} = await import(
             "../ui/deploy.js"
-          );
-          const { render } = await import("ink");
+            );
+          const {render} = await import("ink");
           const React = await import("react");
 
           const scriptVersion = Date.now().toString();
@@ -198,7 +265,7 @@ export const dev = (program: Program) =>
           let isDirty = false;
 
           async function build() {
-            const { Stacks } = await import("../../stacks/index.js");
+            const {Stacks} = await import("../../stacks/index.js");
             if (isWorking) {
               isDirty = true;
               return;
@@ -286,15 +353,16 @@ export const dev = (program: Program) =>
                   );
                 });
               }
+
               if (!(await promptChangeMode())) {
                 await exit();
               }
             }
             const nextChecksum = await checksum(assembly.directory);
-            const { useSites } = await import("../../constructs/SsrSite.js");
+            const {useSites} = await import("../../constructs/SsrSite.js");
 
-            const component = render(<DeploymentUI assembly={assembly} />);
-            const { Stacks } = await import("../../stacks/index.js");
+            const component = render(<DeploymentUI assembly={assembly}/>);
+            const {Stacks} = await import("../../stacks/index.js");
             const results = await Stacks.deployMany(assembly.stacks);
             component.clear();
             component.unmount();
@@ -303,7 +371,7 @@ export const dev = (program: Program) =>
             // Run after initial deploy
             if (!lastDeployed) {
               await import("../../stacks/app-metadata.js").then((mod) =>
-                mod.saveAppMetadata({ mode: "dev" })
+                mod.saveAppMetadata({mode: "dev"})
               );
 
               // Check failed stacks
@@ -312,25 +380,25 @@ export const dev = (program: Program) =>
               );
               failed
                 ? trackDevError(
-                    new Error(`CloudFormation status ${failed.status}`)
-                  )
+                  new Error(`CloudFormation status ${failed.status}`)
+                )
                 : trackDevRunning();
               // print start frontend commands
               useSites()
-                .all.filter(({ props }) => props.dev?.deploy !== true)
-                .forEach(({ type, props }) => {
+                .all.filter(({props}) => props.dev?.deploy !== true)
+                .forEach(({type, props}) => {
                   const framework =
                     type === "AstroSite"
                       ? "Astro"
                       : type === "NextjsSite"
-                      ? "Next.js"
-                      : type === "RemixSite"
-                      ? "Remix"
-                      : type === "SolidStartSite"
-                      ? "SolidStart"
-                      : type === "SvelteKitSite"
-                      ? "SvelteKit"
-                      : undefined;
+                        ? "Next.js"
+                        : type === "RemixSite"
+                          ? "Remix"
+                          : type === "SolidStartSite"
+                            ? "SolidStart"
+                            : type === "SvelteKitSite"
+                              ? "SvelteKit"
+                              : undefined;
                   if (framework) {
                     const cdCmd =
                       path.resolve(props.path) === process.cwd()
@@ -351,7 +419,7 @@ export const dev = (program: Program) =>
             // Write outputs.json
             fs.writeFile(
               project.config.outputs ||
-                path.join(project.paths.out, "outputs.json"),
+              path.join(project.paths.out, "outputs.json"),
               JSON.stringify(
                 mapValues(results, (val) => val.outputs),
                 null,
@@ -376,7 +444,7 @@ export const dev = (program: Program) =>
                     "aws:cloudformation:stack"
                 )
                 .map(async (key: string) => {
-                  const { templateFile } =
+                  const {templateFile} =
                     cdkManifest.artifacts[key].properties;
                   const templatePath = path.join(cdkOutPath, templateFile);
                   const templateContent = await fs.readFile(templatePath);
@@ -395,7 +463,7 @@ export const dev = (program: Program) =>
             if (
               !project.metafile.inputs[
                 evt.properties.relative.split(path.sep).join(path.posix.sep)
-              ]
+                ]
             )
               return;
             build();
@@ -438,7 +506,7 @@ export const dev = (program: Program) =>
         );
 
         clear();
-        await printHeader({ console: true, hint: "ready!" });
+        await printHeader({console: true, hint: "ready!"});
         await Promise.all([
           useStackBuilder(),
           useMetadataCache(),
@@ -462,6 +530,13 @@ export const dev = (program: Program) =>
           import("./plugins/warmer.js").then((mod) => mod.useRDSWarmer()),
           useFunctionLogger(),
         ]);
+
+        // Trigger warmup by invoking Lambda functions with warmup payloads
+        // This creates workers through the real request flow
+        import("../../runtime/workers.js").then(async (mod) => {
+          const workers = await mod.useRuntimeWorkers();
+          await workers.triggerWarmup(30);
+        });
       } catch (e: any) {
         await exitWithError(e);
       }

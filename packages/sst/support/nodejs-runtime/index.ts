@@ -3,17 +3,49 @@ import path from "path";
 import fs from "fs";
 import http from "http";
 import url from "url";
+import os from "os";
 import { Context as LambdaContext } from "aws-lambda";
 // import { createRequire } from "module";
 // global.require = createRequire(import.meta.url);
 
+// Enable V8 compile cache for faster subsequent worker starts (Node.js 22+)
+// First worker compiles and caches bytecode, subsequent workers load from cache
+try {
+  const mod = await import("node:module");
+  if (typeof mod.enableCompileCache === "function") {
+    const cacheDir = path.join(os.tmpdir(), "sst-compile-cache");
+    mod.enableCompileCache(cacheDir);
+  }
+} catch {
+  // Node.js < 22.8 or compile cache not available - continue without it
+}
+
 const input = workerData;
-const parsed = path.parse(input.handler);
-const file = [".js", ".jsx", ".mjs", ".cjs"]
-  .map((ext) => path.join(input.out, parsed.dir, parsed.name + ext))
-  .find((file) => {
-    return fs.existsSync(file);
-  })!;
+
+// Check for mono-bundle mode: use the flag passed from parent process, fallback to file check
+const monoBundlePath = path.join(input.out, "index.mjs");
+const useMonoBundle = input.isMonoBuild ?? (input.handler === "index.handler" && fs.existsSync(monoBundlePath));
+
+let file: string;
+let handlerName: string;
+
+if (useMonoBundle) {
+  // Mono-bundle mode: load from single bundled file
+  file = monoBundlePath;
+  handlerName = "handler"; // handler-functions.ts exports 'handler'
+} else {
+  // Individual handler mode (legacy)
+  const parsed = path.parse(input.handler);
+  const foundFile = [".js", ".jsx", ".mjs", ".cjs"]
+    .map((ext) => path.join(input.out, parsed.dir, parsed.name + ext))
+    .find((f) => fs.existsSync(f));
+
+  if (!foundFile) {
+    throw new Error(`Could not find handler file for "${input.handler}"`);
+  }
+  file = foundFile;
+  handlerName = parsed.ext.substring(1);
+}
 
 let fn: any;
 
@@ -59,16 +91,20 @@ function fetch(req: {
 try {
   const { href } = url.pathToFileURL(file);
   const mod = await import(href);
-  const handler = parsed.ext.substring(1);
-  fn = mod[handler];
+  fn = mod[handlerName];
   if (!fn) {
     throw new Error(
-      `Function "${handler}" not found in "${
-        input.handler
-      }". Found ${Object.keys(mod).join(", ")}`
+      useMonoBundle
+        ? `Mono-bundle handler "${handlerName}" not found in "${file}". Found: ${Object.keys(mod).join(", ")}`
+        : `Function "${handlerName}" not found in "${input.handler}". Found: ${Object.keys(mod).join(", ")}`
     );
   }
-  // if (!mod) mod = require(file);
+
+  // For mono-bundle: eagerly load one handler to warm the shared chunks
+  // This triggers loading of the 35MB+ shared chunks that are lazy-loaded
+  if (useMonoBundle && mod.warmUp) {
+    await mod.warmUp();
+  }
 } catch (ex: any) {
   await fetch({
     path: `/runtime/init/error`,
@@ -117,6 +153,21 @@ while (true) {
       method: "GET",
       headers: {},
     });
+
+    // For mono-build shared pool: set function ID per-invocation for dynamic dispatch
+    const sstFunctionId = result.headers["lambda-runtime-sst-function-id"];
+    if (sstFunctionId) {
+      process.env.SST_FUNCTION_ID = sstFunctionId;
+    }
+
+    // Parse wrapped response: { event, env }
+    // Apply per-invocation env vars to prevent leakage when workers are reused
+    const parsed = JSON.parse(result.body);
+    const invocationEnv = parsed.env;
+    if (invocationEnv && typeof invocationEnv === "object") {
+      Object.assign(process.env, invocationEnv);
+    }
+
     context = {
       awsRequestId: result.headers["lambda-runtime-aws-request-id"],
       invokedFunctionArn: result.headers["lambda-runtime-invoked-function-arn"],
@@ -133,9 +184,10 @@ while (true) {
       clientContext:
         JSON.parse(result.headers["lambda-runtime-client-context"]) ??
         undefined,
-      functionName: process.env.AWS_LAMBDA_FUNCTION_NAME!,
-      functionVersion: process.env.AWS_LAMBDA_FUNCTION_VERSION!,
-      memoryLimitInMB: process.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE!,
+      // Per-invocation function context from headers (essential for mono-build shared workers)
+      functionName: result.headers["lambda-runtime-function-name"] || process.env.AWS_LAMBDA_FUNCTION_NAME!,
+      functionVersion: result.headers["lambda-runtime-function-version"] || process.env.AWS_LAMBDA_FUNCTION_VERSION!,
+      memoryLimitInMB: result.headers["lambda-runtime-function-memory-size"] || process.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE!,
       logGroupName: result.headers["lambda-runtime-log-group-name"],
       logStreamName: result.headers["lambda-runtime-log-stream-name"],
       callbackWaitsForEmptyEventLoop: {
@@ -164,7 +216,7 @@ while (true) {
         );
       },
     };
-    request = JSON.parse(result.body);
+    request = parsed.event;
   } catch {
     continue;
   }
