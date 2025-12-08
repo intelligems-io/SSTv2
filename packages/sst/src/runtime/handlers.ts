@@ -16,6 +16,12 @@ import { usePythonHandler } from "./handlers/python.js";
 import { useRustHandler } from "./handlers/rust.js";
 import { lazy } from "../util/lazy.js";
 import { Semaphore } from "../util/semaphore.js";
+import {isMonoBuildEnabled, isMonoBuildPath} from "./mono-build-config.js";
+
+// Build concurrency semaphore - only used for actual builds, not mono-build lookups
+const buildSemaphore = new Semaphore(
+  parseInt(process.env.SST_BUILD_CONCURRENCY || "4", 10)
+);
 
 declare module "../bus.js" {
   export interface Events {
@@ -24,6 +30,7 @@ declare module "../bus.js" {
     };
     "function.build.success": {
       functionID: string;
+      monoBundle?: boolean;
     };
     "function.build.failed": {
       functionID: string;
@@ -47,6 +54,8 @@ export interface StartWorkerInput {
   out: string;
   handler: string;
   runtime: string;
+  /** Whether this worker is using mono build mode */
+  isMonoBuild?: boolean;
 }
 
 interface ShouldBuildInput {
@@ -64,6 +73,7 @@ export interface RuntimeHandler {
         type: "success";
         handler: string;
         sourcemap?: string;
+    out?: string; // Optional: if provided, use this instead of artifacts path (for mono-bundle)
       }
     | {
         type: "error";
@@ -98,7 +108,40 @@ export const useRuntimeHandlers = lazy(() => {
       return result;
     },
     async build(functionID: string, mode: BuildInput["mode"]) {
-      async function task() {
+      // Fast path for mono-bundle: check without semaphore since no actual build work
+      async function tryMonoBundleFastPath() {
+        const func = useFunctions().fromID(functionID);
+        if (!func) return null;
+
+        const handler = result.for(func.runtime!);
+        const out = path.join(project.paths.artifacts, functionID);
+
+        // Check for mono-bundle mode by doing a preliminary build call
+        // In mono-bundle mode, handler returns its own out path immediately without building
+        const monoBundleCheck = await handler!.build({
+          functionID,
+          out,
+          mode,
+          props: func,
+        });
+
+        // If mono-bundle detected (handler returned custom out), skip all artifact work
+        // Don't fire build events - mono-bundle is built externally by esbuild watch
+        // Worker pool invalidation is handled separately when bundle file actually changes
+        if (monoBundleCheck.type === "success" && monoBundleCheck.out) {
+          return {
+            type: "success" as const,
+            handler: monoBundleCheck.handler,
+            out: monoBundleCheck.out,
+            sourcemap: monoBundleCheck.sourcemap,
+          };
+        }
+
+        return null; // Not mono-bundle, need full build
+      }
+
+      // Full build with semaphore protection for actual compilation work
+      async function fullBuild() {
         const func = useFunctions().fromID(functionID);
         if (!func)
           return {
@@ -107,6 +150,11 @@ export const useRuntimeHandlers = lazy(() => {
           };
         const handler = result.for(func.runtime!);
         const out = path.join(project.paths.artifacts, functionID);
+
+        // Acquire semaphore only for actual build work
+        const unlock = await buildSemaphore.lock();
+        try {
+          // Non-mono-bundle: follow original flow
         await fs.rm(out, { recursive: true, force: true });
         await fs.mkdir(out, { recursive: true });
 
@@ -161,6 +209,20 @@ export const useRuntimeHandlers = lazy(() => {
           out,
           sourcemap: built.sourcemap,
         };
+        } finally {
+          unlock();
+        }
+      }
+
+      async function task() {
+        // Try mono-bundle fast path first (no semaphore needed)
+        const monoBundleResult = await tryMonoBundleFastPath();
+        if (monoBundleResult) {
+          return monoBundleResult;
+        }
+
+        // Fall back to full build with semaphore protection
+        return fullBuild();
       }
 
       if (pendingBuilds.has(functionID)) {
@@ -189,24 +251,42 @@ interface Artifact {
 export const useFunctionBuilder = lazy(() => {
   const artifacts = new Map<string, Artifact>();
   const handlers = useRuntimeHandlers();
-  const semaphore = new Semaphore(4);
+
+  // Track pending builds to prevent duplicate concurrent builds for same function
+  const pendingArtifactBuilds = new Map<string, Promise<Artifact | undefined>>();
 
   const result = {
     artifact: (functionID: string) => {
+      // Fast path: already cached - return immediately without any async work
       if (artifacts.has(functionID)) return artifacts.get(functionID)!;
       return result.build(functionID);
     },
-    build: async (functionID: string) => {
-      const unlock = await semaphore.lock();
+    build: async (functionID: string): Promise<Artifact | undefined> => {
+      // Fast path: already cached (check again in case of concurrent calls)
+      if (artifacts.has(functionID)) return artifacts.get(functionID)!;
+
+      // Deduplication: if build already in progress for this function, wait for it
+      const pending = pendingArtifactBuilds.get(functionID);
+      if (pending) return pending;
+
+      const buildTask = async (): Promise<Artifact | undefined> => {
       try {
-        const result = await handlers.build(functionID, "start");
-        if (!result) return;
-        if (result.type === "error") return;
-        artifacts.set(functionID, result);
+          // handlers.build() handles semaphore internally:
+          // - mono-build: no semaphore (fast path)
+          // - non-mono-build: semaphore protected
+          const buildResult = await handlers.build(functionID, "start");
+          if (!buildResult) return;
+          if (buildResult.type === "error") return;
+          artifacts.set(functionID, buildResult);
         return artifacts.get(functionID)!;
       } finally {
-        unlock();
+          pendingArtifactBuilds.delete(functionID);
       }
+      };
+
+      const promise = buildTask();
+      pendingArtifactBuilds.set(functionID, promise);
+      return promise;
     },
   };
 
@@ -215,6 +295,11 @@ export const useFunctionBuilder = lazy(() => {
     try {
       const functions = useFunctions();
       for (const [functionID, info] of Object.entries(functions.all)) {
+        // Optimization: For mono-build, the artifact path is stable and build is handled externally.
+        // We can skip the potentially expensive shouldBuild check and rebuild call.
+        const existing = artifacts.get(functionID);
+        if (existing && isMonoBuildPath(existing.out)) continue;
+
         const handler = handlers.for(info.runtime!);
         if (
           !handler?.shouldBuild({
@@ -226,7 +311,8 @@ export const useFunctionBuilder = lazy(() => {
         await result.build(functionID);
         Logger.debug("Rebuilt function", functionID);
       }
-    } catch {}
+    } catch {
+    }
   });
 
   return result;

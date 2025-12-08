@@ -13,6 +13,7 @@ import { Colors } from "../../cli/colors.js";
 import { Logger } from "../../logger.js";
 import { findAbove, findBelow } from "../../util/fs.js";
 import { lazy } from "../../util/lazy.js";
+import {useMonoBuildConfig} from "../mono-build-config.js";
 
 export const useNodeHandler = (): RuntimeHandler => {
   const rebuildCache: Record<
@@ -43,7 +44,6 @@ export const useNodeHandler = (): RuntimeHandler => {
     canHandle: (input) => input.startsWith("nodejs"),
     startWorker: async (input) => {
       const workers = await useRuntimeWorkers();
-      new Promise(async () => {
         const worker = new Worker(
           url.fileURLToPath(
             new URL("../../support/nodejs-runtime/index.mjs", import.meta.url)
@@ -68,13 +68,57 @@ export const useNodeHandler = (): RuntimeHandler => {
         });
         worker.on("exit", () => workers.exited(input.workerID));
         threads.set(input.workerID, worker);
-      });
     },
     stopWorker: async (workerID) => {
       const worker = threads.get(workerID);
       await worker?.terminate();
     },
     build: async (input) => {
+      // Check for dev mode mono-bundle using global config
+      const monoBuildConfig = useMonoBuildConfig();
+      if (input.mode === "start" && monoBuildConfig.enabled) {
+        Colors.line(
+          Colors.prefix,
+          Colors.dim.bold("MonoBundle"),
+          Colors.dim(`mode=${input.mode}, handler=${input.props.handler}`)
+        );
+
+        // Symlink node_modules to mono-bundle dir for external dependencies
+        // Only create if symlink doesn't exist or points to wrong location (avoid redundant I/O)
+        const parsed = path.parse(input.props.handler!);
+        const handlerFunctionsDir = path.join(project.paths.root, parsed.dir);
+        const root = await findAbove(handlerFunctionsDir, "package.json");
+        if (root) {
+          const sourceNodeModules = path.resolve(root, "node_modules");
+          const monoBundleNodeModules = path.join(monoBuildConfig.dir, "node_modules");
+          try {
+            const existingTarget = await fs.readlink(monoBundleNodeModules);
+            if (existingTarget === sourceNodeModules) {
+              // Symlink already correct, skip
+            } else {
+              // Symlink points to wrong location, recreate
+              await fs.rm(monoBundleNodeModules, {recursive: true, force: true});
+              await fs.symlink(sourceNodeModules, monoBundleNodeModules, "dir");
+              Logger.debug("Symlinked node_modules for mono-bundle from:", sourceNodeModules);
+            }
+          } catch {
+            // Symlink doesn't exist, create it
+            try {
+              await fs.symlink(sourceNodeModules, monoBundleNodeModules, "dir");
+              Logger.debug("Symlinked node_modules for mono-bundle from:", sourceNodeModules);
+            } catch (err) {
+              Logger.debug("Failed to symlink node_modules for mono-bundle:", err);
+            }
+          }
+        }
+
+        return {
+          type: "success" as const,
+          handler: monoBuildConfig.handler,
+          out: monoBuildConfig.dir,
+        };
+      }
+
       const parsed = path.parse(input.props.handler!);
       const file = [
         ".ts",
@@ -135,7 +179,8 @@ export const useNodeHandler = (): RuntimeHandler => {
             path.resolve(path.join(input.out, "node_modules")),
             "dir"
           );
-        } catch {}
+        } catch {
+        }
       }
 
       // Rebuilt using existing esbuild context
