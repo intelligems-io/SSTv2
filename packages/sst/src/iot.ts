@@ -226,6 +226,103 @@ export const useIOT = lazy(async () => {
   };
 });
 
+/**
+ * A second connection, carrying only small control messages.
+ *
+ * `useIOT` also carries response bodies. Those are fragmented into 50KB chunks
+ * and published at QoS 1, so every chunk waits on a broker round trip, and they
+ * queue on the same socket as everything else.
+ *
+ * `function.ack` cannot afford to wait behind them. The Lambda re-invokes if the
+ * ack does not arrive within two seconds, and each re-invocation re-runs the
+ * handler and puts another response body on the socket that is already busy —
+ * so a late ack makes the next ack later still. Measured on one machine before
+ * this change: ack publish went from 105ms to 10.2s inside a minute, publishes
+ * in flight from 15 to 439, and a single request executed fifteen times before
+ * the gateway returned 504 at 29s.
+ *
+ * Round-trip latency decides who sees it. A chunk costs a round trip to the
+ * region — roughly 90ms from Europe against 15ms from the US — so the same
+ * payload lands either side of the two second budget depending on where the
+ * developer sits.
+ *
+ * **The client id must differ from `useIOT`'s.** AWS IoT drops an existing
+ * connection when a new one presents the same id, so a shared id would make the
+ * two sockets disconnect each other in a loop.
+ *
+ * This connection deliberately does not subscribe. Inbound traffic still arrives
+ * on `useIOT`; this one only publishes.
+ */
+export const useIOTControl = lazy(async () => {
+  const bus = useBus();
+  const endpoint = await useIOTEndpoint();
+  const creds = await useAWSCredentials();
+  const project = useProject();
+
+  const device = new iot.device({
+    protocol: "wss",
+    host: endpoint,
+    region: project.config.region,
+    accessKeyId: creds.accessKeyId,
+    secretKey: creds.secretAccessKey,
+    sessionToken: creds.sessionToken,
+    reconnectPeriod: 1,
+    keepalive: 60,
+    clientId: `sst-control-${Math.random().toString(16).slice(2)}`,
+  });
+  const PREFIX = `/sst/${project.config.name}/${project.config.stage}`;
+
+  device.on("connect", () => {
+    Logger.debug("IoT control connected");
+  });
+  device.on("error", (err) => {
+    Logger.debug("IoT control error", err);
+  });
+  device.on("close", () => {
+    Logger.debug("IoT control closed");
+  });
+  device.on("reconnect", () => {
+    Logger.debug("IoT control reconnecting...");
+  });
+
+  return {
+    prefix: PREFIX,
+    async publish<Type extends EventTypes>(
+      topic: string,
+      type: Type,
+      properties: Events[Type]
+    ) {
+      const payload: EventPayload = {
+        type,
+        properties,
+        sourceID: bus.sourceID,
+      };
+      // Control messages sit far below the fragment size, but the envelope has
+      // to match what the Lambda reassembles, so it is built the same way
+      // rather than assumed to be a single part.
+      const json = JSON.stringify(payload);
+      const parts = json.match(/.{1,50000}/g) ?? [];
+      const id = Math.random().toString();
+      await Promise.all(
+        parts.map(
+          (data, index) =>
+            new Promise<void>((r) => {
+              device.publish(
+                topic,
+                JSON.stringify({ id, index, count: parts.length, data }),
+                { qos: 1 },
+                () => {
+                  r();
+                }
+              );
+            })
+        )
+      );
+      Logger.debug("IOT Control Published", topic, type);
+    },
+  };
+});
+
 export const isSupported = () =>
   [
     "eu-central-1",

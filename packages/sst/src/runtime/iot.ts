@@ -1,5 +1,5 @@
 import { useBus } from "../bus.js";
-import { useIOT } from "../iot.js";
+import { useIOT, useIOTControl } from "../iot.js";
 import { lazy } from "../util/lazy.js";
 import { logInvokeTrace } from "./worker-pool-logging.js";
 import { logIot } from "./debug-bridge-logging.js";
@@ -8,6 +8,9 @@ import { logEventTrace } from "./event-trace-logging.js";
 export const useIOTBridge = lazy(async () => {
   const bus = useBus();
   const iot = await useIOT();
+  // The ack goes out on its own socket so it can never queue behind a response
+  // body. See `useIOTControl`.
+  const control = await useIOTControl();
   const topic = `${iot.prefix}/events`;
 
   bus.subscribe("function.success", async (evt) => {
@@ -37,7 +40,7 @@ export const useIOTBridge = lazy(async () => {
     logIot(`reqId=${requestID?.slice(0, 8)} Publishing function.ack to worker ${workerID.slice(0, 8)}`);
     logInvokeTrace("IOT_ACK_START", workerID, `worker=${workerID.slice(0, 8)}`);
     const startTime = Date.now();
-    await iot.publish(
+    await control.publish(
       topic + "/" + workerID,
       "function.ack",
       evt.properties
