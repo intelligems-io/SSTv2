@@ -36,6 +36,54 @@ interface Fragment {
   data: string;
 }
 
+/**
+ * Re-sign the next reconnect with credentials that are still alive.
+ *
+ * The device is built with resolved credential *values*, because
+ * `aws-iot-device-sdk` takes strings rather than a provider. It keeps them in
+ * closure variables and re-signs the WebSocket URL from those on every
+ * reconnect, and nothing ever writes to them again except this call. So once
+ * the session expires, every retry presents a dead `sessionToken`, AWS IoT
+ * rejects the upgrade, and the socket closes again — forever.
+ *
+ * Measured on one machine: the connection dropped routinely five times in the
+ * first fifteen minutes and recovered each time; an hour later the credentials
+ * expired, and the next drop began **93 consecutive failed reconnects over five
+ * hours**, none of which emitted an `error` event. Nothing in the CLI said
+ * anything, and every request through the Live Lambda bridge 504'd.
+ *
+ * Every other AWS call in the process is unaffected, because `useAWSClient`
+ * passes the *provider* and the SDK calls it per request. This is the one path
+ * that holds values, so it is the one path that needs telling.
+ *
+ * On `close` rather than on a timer: `useAWSCredentials` is memoized and only
+ * reaches the network within five minutes of expiry, so this is an in-memory
+ * read on most drops and one real refresh per session. It does not race the
+ * retry — `reconnectPeriod` starts at 1ms, so the first attempt still signs
+ * with the old values, and the SDK doubles its backoff until one lands with
+ * these.
+ */
+async function refreshWebSocketCredentials(
+  device: iot.device,
+  label: string
+): Promise<void> {
+  try {
+    const fresh = await useAWSCredentials();
+    // The typings mark `expiration` as required, but the implementation only
+    // assigns the three credential strings and never reads it — so this passes
+    // what the provider gave rather than inventing a date to satisfy a
+    // parameter nothing uses.
+    device.updateWebSocketCredentials(
+      fresh.accessKeyId,
+      fresh.secretAccessKey,
+      fresh.sessionToken as string,
+      fresh.expiration as Date
+    );
+  } catch (err) {
+    Logger.debug(`${label} credential refresh failed`, err);
+  }
+}
+
 export const useIOT = lazy(async () => {
   const bus = useBus();
 
@@ -139,6 +187,7 @@ export const useIOT = lazy(async () => {
 
   device.on("close", () => {
     Logger.debug("IoT closed");
+    void refreshWebSocketCredentials(device, "IoT");
   });
 
   device.on("reconnect", () => {
@@ -280,6 +329,7 @@ export const useIOTControl = lazy(async () => {
   });
   device.on("close", () => {
     Logger.debug("IoT control closed");
+    void refreshWebSocketCredentials(device, "IoT control");
   });
   device.on("reconnect", () => {
     Logger.debug("IoT control reconnecting...");
