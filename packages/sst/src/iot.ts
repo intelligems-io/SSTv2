@@ -56,12 +56,25 @@ interface Fragment {
  * passes the *provider* and the SDK calls it per request. This is the one path
  * that holds values, so it is the one path that needs telling.
  *
- * On `close` rather than on a timer: `useAWSCredentials` is memoized and only
- * reaches the network within five minutes of expiry, so this is an in-memory
- * read on most drops and one real refresh per session. It does not race the
- * retry — `reconnectPeriod` starts at 1ms, so the first attempt still signs
- * with the old values, and the SDK doubles its backoff until one lands with
- * these.
+ * **Why `close` and not `reconnect`.** The signing is synchronous and this
+ * refresh is not, so the two race. `emit("reconnect")` runs its handlers and
+ * returns — it does not await them — and `_setupStream()` signs on the next
+ * line, from whatever the variables hold at that instant. A refresh started
+ * there always loses. `close` fires one backoff interval earlier (the SDK
+ * manages its own, from `baseReconnectTimeMs` of 1s up to 128s, ignoring the
+ * `reconnectPeriod` passed in), which is ample for the resolve to land before
+ * the next attempt signs.
+ *
+ * So this wins the race by margin, not by construction. Two things bound it:
+ * `close` fires on **every** failed reconnect, not once per outage, so the
+ * values can never be more than one backoff interval stale; and the retry loop
+ * is unconditional. Making it airtight would mean keeping the stored
+ * credentials warm so the synchronous path can never read a stale one — a
+ * timer, which is machinery duplicating what the memoized provider already
+ * does. Measured recovery is five seconds, so that is not worth it yet.
+ *
+ * The provider only reaches the network within five minutes of expiry, so this
+ * is an in-memory read on most drops and one real refresh per session.
  */
 async function refreshWebSocketCredentials(
   device: iot.device,
