@@ -36,6 +36,67 @@ interface Fragment {
   data: string;
 }
 
+/**
+ * Re-sign the next reconnect with credentials that are still alive.
+ *
+ * The device is built with resolved credential *values*, because
+ * `aws-iot-device-sdk` takes strings rather than a provider. It keeps them in
+ * closure variables and re-signs the WebSocket URL from those on every
+ * reconnect, and nothing ever writes to them again except this call. So once
+ * the session expires, every retry presents a dead `sessionToken`, AWS IoT
+ * rejects the upgrade, and the socket closes again — forever.
+ *
+ * Measured on one machine: the connection dropped routinely five times in the
+ * first fifteen minutes and recovered each time; an hour later the credentials
+ * expired, and the next drop began **93 consecutive failed reconnects over five
+ * hours**, none of which emitted an `error` event. Nothing in the CLI said
+ * anything, and every request through the Live Lambda bridge 504'd.
+ *
+ * Every other AWS call in the process is unaffected, because `useAWSClient`
+ * passes the *provider* and the SDK calls it per request. This is the one path
+ * that holds values, so it is the one path that needs telling.
+ *
+ * **Why `close` and not `reconnect`.** The signing is synchronous and this
+ * refresh is not, so the two race. `emit("reconnect")` runs its handlers and
+ * returns — it does not await them — and `_setupStream()` signs on the next
+ * line, from whatever the variables hold at that instant. A refresh started
+ * there always loses. `close` fires one backoff interval earlier (the SDK
+ * manages its own, from `baseReconnectTimeMs` of 1s up to 128s, ignoring the
+ * `reconnectPeriod` passed in), which is ample for the resolve to land before
+ * the next attempt signs.
+ *
+ * So this wins the race by margin, not by construction. Two things bound it:
+ * `close` fires on **every** failed reconnect, not once per outage, so the
+ * values can never be more than one backoff interval stale; and the retry loop
+ * is unconditional. Making it airtight would mean keeping the stored
+ * credentials warm so the synchronous path can never read a stale one — a
+ * timer, which is machinery duplicating what the memoized provider already
+ * does. Measured recovery is five seconds, so that is not worth it yet.
+ *
+ * The provider only reaches the network within five minutes of expiry, so this
+ * is an in-memory read on most drops and one real refresh per session.
+ */
+async function refreshWebSocketCredentials(
+  device: iot.device,
+  label: string
+): Promise<void> {
+  try {
+    const fresh = await useAWSCredentials();
+    // The typings mark `expiration` as required, but the implementation only
+    // assigns the three credential strings and never reads it — so this passes
+    // what the provider gave rather than inventing a date to satisfy a
+    // parameter nothing uses.
+    device.updateWebSocketCredentials(
+      fresh.accessKeyId,
+      fresh.secretAccessKey,
+      fresh.sessionToken as string,
+      fresh.expiration as Date
+    );
+  } catch (err) {
+    Logger.debug(`${label} credential refresh failed`, err);
+  }
+}
+
 export const useIOT = lazy(async () => {
   const bus = useBus();
 
@@ -139,6 +200,7 @@ export const useIOT = lazy(async () => {
 
   device.on("close", () => {
     Logger.debug("IoT closed");
+    void refreshWebSocketCredentials(device, "IoT");
   });
 
   device.on("reconnect", () => {
@@ -280,6 +342,7 @@ export const useIOTControl = lazy(async () => {
   });
   device.on("close", () => {
     Logger.debug("IoT control closed");
+    void refreshWebSocketCredentials(device, "IoT control");
   });
   device.on("reconnect", () => {
     Logger.debug("IoT control reconnecting...");
