@@ -11,7 +11,9 @@ import {Logger} from "../logger.js";
  * instead of building each handler individually. This significantly speeds up dev mode
  * by sharing compilation work across all handlers.
  *
- * Detection happens once at startup and the result is cached for the session.
+ * Detection latches on: the first check that finds the bundle enables mono
+ * build for the rest of the session. It deliberately does NOT latch off, so a
+ * caller arriving before the bundle has been written cannot disable it.
  */
 export const useMonoBuildConfig = lazy(() => {
   const project = useProject();
@@ -19,19 +21,42 @@ export const useMonoBuildConfig = lazy(() => {
   const monoBundleDir = path.join(project.paths.root, ".mono-build");
   const monoBundlePath = path.join(monoBundleDir, "index.mjs");
 
-  // Check once at startup if mono build exists
-  const enabled = fsSync.existsSync(monoBundlePath);
+  /**
+   * Latches on true, never on false.
+   *
+   * This was a single `existsSync` at first call, cached for the session by
+   * `lazy`. Dev start deletes `.mono-build/index.mjs` and then rebuilds it, so
+   * any caller landing in that window — typically an invocation that beat the
+   * bundle to disk — pinned this to false for the whole session. Every handler
+   * then took the per-function esbuild path, which does not carry the mono
+   * build's `external` list, and failed to resolve packages the mono bundle
+   * never opens. The bundle finishing changed nothing, because the flag had
+   * already been decided, so the session stayed broken until restarted.
+   *
+   * Re-checking until it is found costs one `existsSync` per call for the few
+   * seconds before the bundle lands, and nothing afterwards.
+   */
+  let enabled = false;
 
-  if (enabled) {
-    Logger.debug("Mono build mode enabled:", monoBundlePath);
-  }
+  const isEnabled = (): boolean => {
+    if (!enabled && fsSync.existsSync(monoBundlePath)) {
+      enabled = true;
+      Logger.debug("Mono build mode enabled:", monoBundlePath);
+    }
+    return enabled;
+  };
+
+  isEnabled();
 
   return {
     /**
-     * Whether mono build mode is enabled (detected at startup).
+     * Whether mono build mode is enabled. Re-checked until the bundle is
+     * found, so a check made before it was written does not stick.
      * When true, all Node.js handlers use the shared .mono-build bundle.
      */
-    enabled,
+    get enabled(): boolean {
+      return isEnabled();
+    },
 
     /**
      * The mono bundle directory (.mono-build)
@@ -53,7 +78,7 @@ export const useMonoBuildConfig = lazy(() => {
      * This is useful when you have a build result and need to determine its type.
      */
     isMonoBuildPath(buildOut: string): boolean {
-      return enabled && buildOut.includes(".mono-build");
+      return isEnabled() && buildOut.includes(".mono-build");
     },
 
     /**
@@ -62,7 +87,7 @@ export const useMonoBuildConfig = lazy(() => {
      * For non-mono build: per-function key
      */
     getPoolKey(functionID: string, runtime: string, buildOut: string): { key: string; isShared: boolean } {
-      if (enabled && buildOut.includes(".mono-build")) {
+      if (isEnabled() && buildOut.includes(".mono-build")) {
         return { key: `${runtime}:mono-build`, isShared: true };
       }
       return { key: `${runtime}:${functionID}`, isShared: false };
