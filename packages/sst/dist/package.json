@@ -1,7 +1,7 @@
 {
   "sideEffects": false,
   "name": "@intelligems/sst",
-  "version": "2.49.6-ig.6",
+  "version": "2.49.6-ig.10",
   "bin": {
     "sst": "cli/sst.js"
   },
