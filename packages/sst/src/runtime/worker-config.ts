@@ -17,7 +17,7 @@ export const POOL_SIZE = int("SST_WORKER_POOL_SIZE", 4);
 export const IDLE_TIMEOUT = int("SST_WORKER_IDLE_TIMEOUT", 5 * 60 * 1000);
 
 /** Invocations one Node worker may run at the same time. */
-export const WORKER_CONCURRENCY = Math.max(1, int("SST_WORKER_CONCURRENCY", 1));
+export const WORKER_CONCURRENCY = Math.max(1, int("SST_WORKER_CONCURRENCY", 5));
 
 /** Warm pings sent at dev start. 0 disables warmup. Capped at POOL_SIZE. */
 export const WARMUP_COUNT = Math.min(POOL_SIZE, Math.max(0, int("SST_WARMUP_COUNT", POOL_SIZE)));
