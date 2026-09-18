@@ -14,6 +14,8 @@ import { Logger } from "../../logger.js";
 import { findAbove, findBelow } from "../../util/fs.js";
 import { lazy } from "../../util/lazy.js";
 import {useMonoBuildConfig} from "../mono-build-config.js";
+import { SOURCE_MAPS, WORKER_MAX_HEAP_MB } from "../worker-config.js";
+import { forgetWorkerMemory, recordWorkerMemory } from "../memory-logging.js";
 
 export const useNodeHandler = (): RuntimeHandler => {
   const rebuildCache: Record<
@@ -44,33 +46,54 @@ export const useNodeHandler = (): RuntimeHandler => {
     canHandle: (input) => input.startsWith("nodejs"),
     startWorker: async (input) => {
       const workers = await useRuntimeWorkers();
-        const worker = new Worker(
-          url.fileURLToPath(
-            new URL("../../support/nodejs-runtime/index.mjs", import.meta.url)
-          ),
-          {
-            env: {
-              ...input.environment,
-              IS_LOCAL: "true",
-            },
-            execArgv: ["--enable-source-maps"],
-            workerData: input,
-            stderr: true,
-            stdin: true,
-            stdout: true,
-          }
-        );
-        worker.stdout.on("data", (data: Buffer) => {
-          workers.stdout(input.workerID, data.toString());
-        });
-        worker.stderr.on("data", (data: Buffer) => {
-          workers.stdout(input.workerID, data.toString());
-        });
-        worker.on("exit", () => workers.exited(input.workerID));
-        threads.set(input.workerID, worker);
+      const worker = new Worker(
+        url.fileURLToPath(
+          new URL("../../support/nodejs-runtime/index.mjs", import.meta.url)
+        ),
+        {
+          env: {
+            ...input.environment,
+            IS_LOCAL: "true",
+          },
+          // Source maps cost memory in every isolate; opt in with SST_SOURCE_MAPS=true
+          execArgv: SOURCE_MAPS ? ["--enable-source-maps"] : [],
+          // Cap each isolate so a leaking handler kills its own worker
+          // instead of growing the whole dev process until the machine stalls
+          resourceLimits:
+            WORKER_MAX_HEAP_MB > 0
+              ? { maxOldGenerationSizeMb: WORKER_MAX_HEAP_MB }
+              : undefined,
+          workerData: input,
+          stderr: true,
+          stdin: true,
+          stdout: true,
+        }
+      );
+      worker.stdout.on("data", (data: Buffer) => {
+        workers.stdout(input.workerID, data.toString());
+      });
+      worker.stderr.on("data", (data: Buffer) => {
+        workers.stdout(input.workerID, data.toString());
+      });
+      worker.on("message", (msg: any) => {
+        if (msg && msg.type === "sst.memory") {
+          recordWorkerMemory(input.workerID, msg.report);
+        }
+      });
+      worker.on("error", (err) => {
+        Logger.debug("Worker error", input.workerID, err);
+      });
+      worker.on("exit", () => {
+        threads.delete(input.workerID);
+        forgetWorkerMemory(input.workerID);
+        workers.exited(input.workerID);
+      });
+      threads.set(input.workerID, worker);
     },
     stopWorker: async (workerID) => {
       const worker = threads.get(workerID);
+      threads.delete(workerID);
+      forgetWorkerMemory(workerID);
       await worker?.terminate();
     },
     build: async (input) => {

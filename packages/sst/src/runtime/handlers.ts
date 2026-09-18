@@ -56,6 +56,10 @@ export interface StartWorkerInput {
   runtime: string;
   /** Whether this worker is using mono build mode */
   isMonoBuild?: boolean;
+  /** Invocations this worker may run at once (Node only; others run one). */
+  concurrency?: number;
+  /** Ask the worker to report its memory usage to the parent. */
+  debugMemory?: boolean;
 }
 
 interface ShouldBuildInput {

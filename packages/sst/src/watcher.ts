@@ -26,6 +26,8 @@ export const useWatcher = lazy(() => {
       "**/node_modules/**",
       "**/.build/**",
       "**/.sst/**",
+      "**/.mono-build/**",
+      "**/cdk.out/**",
       "**/.git/**",
       "**/debug.log",
     ],

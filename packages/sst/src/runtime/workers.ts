@@ -1,15 +1,13 @@
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
-import { useBus } from "../bus.js";
-import { useFunctionBuilder, useRuntimeHandlers } from "./handlers.js";
-import {useRuntimeServerConfig, useRuntimeServer} from "./server.js";
-import { useFunctions } from "../constructs/Function.js";
+import { EventPayload, useBus } from "../bus.js";
+import { RuntimeHandler, useFunctionBuilder, useRuntimeHandlers } from "./handlers.js";
+import { useRuntimeServerConfig, useRuntimeServer } from "./server.js";
+import { FunctionProps, useFunctions } from "../constructs/Function.js";
 import { lazy } from "../util/lazy.js";
-import {Logger} from "../logger.js";
+import { Logger } from "../logger.js";
 import {
-  POOL_SIZE,
-  IDLE_TIMEOUT,
   logPool,
   logInvokeTrace,
   trackRequestStart,
@@ -17,10 +15,19 @@ import {
   setFunctionNameResolver,
   writeSessionEndSummary,
 } from "./worker-pool-logging.js";
-import {useMonoBuildConfig, isMonoBuildPath} from "./mono-build-config.js";
-import {getRequestPath, getCorrelationId, getApiGatewayRequestId} from "./request-utils.js";
-import {logWorkers} from "./debug-bridge-logging.js";
-import {logEventTrace} from "./event-trace-logging.js";
+import {
+  POOL_SIZE,
+  IDLE_TIMEOUT,
+  WORKER_CONCURRENCY,
+  DEBUG_MEMORY,
+} from "./worker-config.js";
+import { PoolWorker, TerminateReason, WorkerPool } from "./worker-pool.js";
+import { splitAttributed } from "./stdout-attribution.js";
+import { startMemorySampling } from "./memory-logging.js";
+import { useMonoBuildConfig, isMonoBuildPath } from "./mono-build-config.js";
+import { getRequestPath, getCorrelationId, getApiGatewayRequestId } from "./request-utils.js";
+import { logWorkers } from "./debug-bridge-logging.js";
+import { logEventTrace } from "./event-trace-logging.js";
 
 declare module "../bus.js" {
   export interface Events {
@@ -35,6 +42,8 @@ declare module "../bus.js" {
     "worker.exited": {
       workerID: string;
       functionID: string;
+      /** Set for pooled workers: the id the runtime server keys on. */
+      pooledWorkerID?: string;
     };
     "worker.stdout": {
       workerID: string;
@@ -69,20 +78,25 @@ interface Worker {
   functionID: string;
 }
 
-interface PooledWorker {
-  pooledWorkerID: string;
+/** One invocation currently held by a pooled worker. */
+interface InFlightRequest {
+  requestID: string;
+  awsWorkerID: string;
   functionID: string;
-  state: "idle" | "busy";
-  idleTimer?: NodeJS.Timeout;
-  createdAt: number;
-  poolKey: string;        // Pool lookup key (shared for mono-build)
-  isSharedPool: boolean;  // Whether using shared pool (mono-build mode)
-  bundlePath?: string;    // Path to bundle file (for mtime checking)
-  bundleMtime?: number;   // Bundle mtime when worker was created
+  pooledWorkerID: string;
+  startedAt: number;
 }
 
-// Track workers marked as stale (should not return to pool after completion)
-const staleWorkers = new Set<string>();
+/** An invocation that is waiting for pool capacity. */
+interface PendingInvocation {
+  evt: EventPayload<"function.invoked">;
+  props: FunctionProps;
+  handler: RuntimeHandler;
+  build: { out: string; handler: string };
+  poolKey: string;
+  isShared: boolean;
+  queuedAt: number;
+}
 
 const bundleMtimes = new Map<string, number>();
 const bundleWatchers = new Map<string, fs.FSWatcher>();
@@ -150,7 +164,6 @@ function getPoolKey(
   runtime: string,
   buildOut: string
 ): { key: string; isShared: boolean } {
-  // Use the global mono build config for pool key calculation
   return useMonoBuildConfig().getPoolKey(functionID, runtime, buildOut);
 }
 
@@ -216,6 +229,11 @@ function isPoolableRuntime(
   );
 }
 
+/** Only the Node runtime shim knows how to run invocations side by side. */
+function concurrencyFor(runtime: string): number {
+  return runtime.startsWith("nodejs") ? WORKER_CONCURRENCY : 1;
+}
+
 export const useRuntimeWorkers = lazy(async () => {
   // Set up function name resolver for logging module
   setFunctionNameResolver(getFunctionName);
@@ -223,22 +241,29 @@ export const useRuntimeWorkers = lazy(async () => {
   // Non-pooled workers (legacy behavior)
   const workers = new Map<string, Worker>();
 
-  // Worker pool data structures
-  const workerPool = new Map<string, PooledWorker[]>();
-  const activeWorkers = new Map<string, PooledWorker>();
-  const workerIDMapping = new Map<string, string>(); // awsWorkerID → pooledWorkerID
-  const reverseMapping = new Map<string, string>(); // pooledWorkerID → awsWorkerID
-  const startedWorkers = new Set<string>(); // Track started pooledWorkerIDs
+  // Pooled workers and the invocations they hold
+  const requests = new Map<string, InFlightRequest>(); // requestID → request
+  const lastRequestId = new Map<string, string>(); // workerID → most recent requestID
+  const waitQueues = new Map<string, PendingInvocation[]>(); // poolKey → waiting
 
   const bus = useBus();
   const handlers = useRuntimeHandlers();
   const builder = useFunctionBuilder();
   const serverConfig = await useRuntimeServerConfig();
 
+  const pool = new WorkerPool({
+    maxWorkers: POOL_SIZE,
+    idleTimeoutMs: IDLE_TIMEOUT,
+    onTerminate: (worker, reason) => {
+      void stopPooledWorker(worker, reason);
+    },
+  });
+
   // Log pool configuration on startup
   logPool("INIT", {
     poolSize: POOL_SIZE,
     idleTimeoutMs: IDLE_TIMEOUT,
+    concurrency: WORKER_CONCURRENCY,
     poolableRuntimes: [...POOLABLE_RUNTIMES].length,
   });
 
@@ -252,265 +277,284 @@ export const useRuntimeWorkers = lazy(async () => {
     return _server;
   }
 
-  // Helper: Terminate a pooled worker
-  async function terminatePooledWorker(
-    pooledWorkerID: string,
-    reason?: string
-  ) {
-    const worker =
-      activeWorkers.get(pooledWorkerID) ||
-      [...workerPool.values()]
-        .flat()
-        .find((w) => w.pooledWorkerID === pooledWorkerID);
-    if (!worker) return;
+  function queuedCount(poolKey?: string) {
+    if (poolKey) return waitQueues.get(poolKey)?.length ?? 0;
+    let total = 0;
+    for (const q of waitQueues.values()) total += q.length;
+    return total;
+  }
 
-        const props = useFunctions().fromID(worker.functionID);
-        if (!props) return;
-
-    const uptime = Date.now() - worker.createdAt;
+  // Helper: stop a pooled worker that the pool has already forgotten
+  async function stopPooledWorker(worker: PoolWorker, reason: TerminateReason) {
     logPool("TERMINATE", {
-      pooledWorkerID: pooledWorkerID.slice(0, 8),
+      pooledWorkerID: worker.id.slice(0, 8),
       functionID: worker.functionID,
-      reason: reason || "unknown",
-      uptimeMs: uptime,
+      reason,
+      uptimeMs: Date.now() - worker.createdAt,
+      inFlight: worker.inFlight,
     });
 
-        const handler = handlers.for(props.runtime!);
-    await handler?.stopWorker(pooledWorkerID);
-
-    // Clean up mappings
-    activeWorkers.delete(pooledWorkerID);
-    staleWorkers.delete(pooledWorkerID);
-    const awsWorkerID = reverseMapping.get(pooledWorkerID);
-    if (awsWorkerID) {
-      workerIDMapping.delete(awsWorkerID);
+    try {
+      const handler = handlers.for(worker.runtime);
+      await handler?.stopWorker(worker.id);
+    } catch (ex) {
+      Logger.debug("Failed to stop pooled worker", worker.id, ex);
     }
-    reverseMapping.delete(pooledWorkerID);
-    startedWorkers.delete(pooledWorkerID);
-    lastRequestId.delete(pooledWorkerID);
+    lastRequestId.delete(worker.id);
+    Logger.debug("Terminated pooled worker", worker.id);
 
-    Logger.debug("Terminated pooled worker", pooledWorkerID);
+    // A slot opened up
+    void drain(worker.poolKey);
   }
 
-  // Helper: Get idle worker from pool
-  // Uses poolKey for lookup (shared key for mono-build)
-  function getIdleWorker(
-    poolKey: string,
-    functionID: string,
-    buildOut: string
-  ): PooledWorker | undefined {
-    const pool = workerPool.get(poolKey);
-    if (!pool || pool.length === 0) {
-      logPool("POOL_MISS", {
-        functionID,
-        poolKey: poolKey.slice(0, 30),
-        poolSize: 0,
+  // Helper: publish an error for every invocation a worker was holding
+  function failRequestsOn(pooledWorkerID: string, errorType: string, errorMessage: string) {
+    for (const req of [...requests.values()]) {
+      if (req.pooledWorkerID !== pooledWorkerID) continue;
+      requests.delete(req.requestID);
+      trackRequestEnd(req.functionID);
+      bus.publish("function.error", {
+        workerID: req.awsWorkerID,
+        functionID: req.functionID,
+        requestID: req.requestID,
+        errorType,
+        errorMessage,
+        trace: [],
       });
-      return undefined;
     }
+  }
 
-    // Check current bundle mtime for staleness detection
-    const currentMtime = getBundleMtime(buildOut);
+  // Helper: hand an invocation to a worker (new or reused)
+  async function assign(worker: PoolWorker, pending: PendingInvocation, reused: boolean) {
+    const { evt } = pending;
+    const { workerID: awsWorkerID, functionID, requestID, event } = evt.properties;
+    const requestPath = getRequestPath(event);
 
-    // Try to find a non-stale worker
-    while (pool.length > 0) {
-      const worker = pool.pop();
-      if (!worker) break;
-
-      clearTimeout(worker.idleTimer);
-
-      // Check if worker is stale (bundle was modified since worker started)
-      if (currentMtime && worker.bundleMtime && currentMtime > worker.bundleMtime) {
-        logPool("STALE_MTIME", {
-          pooledWorkerID: worker.pooledWorkerID.slice(0, 8),
-          functionID,
-          workerMtime: worker.bundleMtime,
-          currentMtime,
-        });
-        terminatePooledWorker(worker.pooledWorkerID, "stale_mtime");
-        continue; // Try next worker
-      }
-
-      worker.state = "busy";
-      const age = Date.now() - worker.createdAt;
-      const crossFunction = worker.functionID !== functionID;
-      logPool("REUSE", {
-        pooledWorkerID: worker.pooledWorkerID.slice(0, 8),
-        functionID,
-        originalFunctionID: crossFunction ? worker.functionID : undefined,
-        poolSizeAfter: pool.length,
-        workerAgeMs: age,
-        crossFunction,
-      });
-      Logger.debug(
-        "Reusing pooled worker",
-        worker.pooledWorkerID,
-        "for",
-        functionID,
-        crossFunction ? "(cross-function reuse)" : ""
-      );
-      return worker;
-    }
-
-    // All workers were stale
-    logPool("POOL_MISS", {
+    pool.checkout(worker, functionID);
+    requests.set(requestID, {
+      requestID,
+      awsWorkerID,
       functionID,
-      poolKey: poolKey.slice(0, 30),
-      poolSize: 0,
-      reason: "all_stale",
+      pooledWorkerID: worker.id,
+      startedAt: Date.now(),
     });
-    return undefined;
+    lastRequestId.set(worker.id, requestID);
+    trackRequestStart(functionID, reused);
+
+    if (reused) {
+      logPool("REUSE", {
+        pooledWorkerID: worker.id.slice(0, 8),
+        functionID,
+        inFlight: worker.inFlight,
+        workerAgeMs: Date.now() - worker.createdAt,
+        waitedMs: Date.now() - pending.queuedAt,
+      });
+      logInvokeTrace("WORKER_REUSE", requestID, `pooled=${worker.id.slice(0, 8)}`);
+      logEventTrace("WORKER_START", {
+        requestID,
+        functionID,
+        workerID: worker.id,
+        path: requestPath,
+        correlationId: getCorrelationId(event),
+        apiGwReqId: getApiGatewayRequestId(event),
+        reused: true,
+      });
+      bus.publish("worker.reused", {
+        workerID: awsWorkerID,
+        functionID,
+        pooledWorkerID: worker.id,
+      });
+    }
+
+    const server = await getServer();
+    logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} Routing invocation to worker ${worker.id.slice(0, 8)} inFlight=${worker.inFlight}`);
+    logInvokeTrace("ROUTE_INVOCATION", requestID);
+    server.routeInvocation(worker.id, evt.properties);
   }
 
-  // Helper: Return worker to pool
-  // Uses poolKey for pool lookup (shared key for mono-build)
-  function returnToPool(pooledWorkerID: string) {
-    const worker = activeWorkers.get(pooledWorkerID);
-    if (!worker) return;
+  // Helper: create a worker for an invocation. The worker is registered (and
+  // counted against the cap) before the thread starts, so concurrent
+  // dispatches cannot overshoot the pool size.
+  async function createAndAssign(pending: PendingInvocation) {
+    const { evt, props, handler, build, poolKey, isShared } = pending;
+    const { workerID: awsWorkerID, functionID, requestID, env, event } = evt.properties;
+    const requestPath = getRequestPath(event);
 
-    // Check if worker is stale (marked for termination due to rebuild)
-    if (staleWorkers.has(pooledWorkerID)) {
-      staleWorkers.delete(pooledWorkerID);
-      logPool("STALE_TERMINATE", {
-        pooledWorkerID: pooledWorkerID.slice(0, 8),
-        functionID: worker.functionID,
-        reason: "marked-stale-during-rebuild",
+    const worker: PoolWorker = {
+      id: crypto.randomBytes(16).toString("hex"),
+      poolKey,
+      functionID,
+      runtime: props.runtime!,
+      inFlight: 0,
+      maxConcurrency: concurrencyFor(props.runtime!),
+      stale: false,
+      createdAt: Date.now(),
+      bundlePath: build.out,
+      bundleMtime: getBundleMtime(build.out),
+      isSharedPool: isShared,
+    };
+    pool.add(worker);
+
+    logPool("CREATE", {
+      pooledWorkerID: worker.id.slice(0, 8),
+      functionID,
+      runtime: props.runtime,
+      requestID: requestID.slice(0, 8),
+      poolKey: poolKey.slice(0, 30),
+      isSharedPool: isShared,
+      liveWorkers: pool.liveCount(poolKey),
+      waitedMs: Date.now() - pending.queuedAt,
+    });
+
+    // Route first so the invocation is queued at the server by the time the
+    // worker asks for it.
+    await assign(worker, pending, false);
+
+    logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} Starting worker ${worker.id.slice(0, 8)}...`);
+    logInvokeTrace("WORKER_START", requestID, `pooled=${worker.id.slice(0, 8)}`);
+    const workerStartTime = Date.now();
+    try {
+      await handler.startWorker({
+        ...build,
+        workerID: worker.id,
+        functionID,
+        environment: env,
+        url: `${serverConfig.url}/${worker.id}/${serverConfig.API_VERSION}`,
+        runtime: props.runtime!,
+        isMonoBuild: isShared,
+        concurrency: worker.maxConcurrency,
+        debugMemory: DEBUG_MEMORY,
       });
-      terminatePooledWorker(pooledWorkerID, "stale");
+    } catch (ex: any) {
+      logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} ERROR: Failed to start worker: ${ex.message}`);
+      Logger.debug("Failed to start pooled worker", ex);
+      pool.remove(worker);
+      failRequestsOn(worker.id, "WorkerStartFailed", `Failed to start pooled worker: ${ex.message}`);
+      lastRequestId.delete(worker.id);
+      void drain(poolKey);
       return;
     }
 
-    // Clean up current request mappings
-    const awsWorkerID = reverseMapping.get(pooledWorkerID);
-    if (awsWorkerID) {
-      workerIDMapping.delete(awsWorkerID);
-      reverseMapping.delete(pooledWorkerID);
+    const workerStartElapsed = Date.now() - workerStartTime;
+    logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} Worker started in ${workerStartElapsed}ms`);
+    logInvokeTrace("WORKER_STARTED", requestID);
+    logEventTrace("WORKER_START", {
+      requestID,
+      functionID,
+      workerID: worker.id,
+      path: requestPath,
+      correlationId: getCorrelationId(event),
+      apiGwReqId: getApiGatewayRequestId(event),
+      elapsed: workerStartElapsed,
+      reused: false,
+    });
+    bus.publish("worker.started", { workerID: awsWorkerID, functionID });
+  }
+
+  // Helper: place an invocation on a worker, create one, or wait for capacity
+  async function dispatch(pending: PendingInvocation) {
+    const { poolKey, build, evt } = pending;
+    const { functionID, requestID } = evt.properties;
+    const currentMtime = getBundleMtime(build.out);
+
+    const worker = pool.pick(poolKey, currentMtime);
+    if (worker) {
+      await assign(worker, pending, true);
+      return;
+    }
+    if (pool.canCreate(poolKey)) {
+      await createAndAssign(pending);
+      return;
     }
 
-    // Use poolKey for pool lookup (shared for mono-build)
-    let pool = workerPool.get(worker.poolKey);
-    if (!pool) {
-      pool = [];
-      workerPool.set(worker.poolKey, pool);
+    let queue = waitQueues.get(poolKey);
+    if (!queue) {
+      queue = [];
+      waitQueues.set(poolKey, queue);
     }
+    queue.push(pending);
+    logPool("POOL_WAIT", {
+      functionID,
+      requestID: requestID.slice(0, 8),
+      poolKey: poolKey.slice(0, 30),
+      queued: queue.length,
+      liveWorkers: pool.liveCount(poolKey),
+    });
+    logInvokeTrace("POOL_WAIT", requestID, `queued=${queue.length}`);
+  }
 
-    if (pool.length >= POOL_SIZE) {
-      // Pool full, terminate
-      logPool("POOL_FULL", {
+  // Helper: give waiting invocations to whatever capacity exists now
+  async function drain(poolKey: string) {
+    const queue = waitQueues.get(poolKey);
+    if (!queue || queue.length === 0) return;
+    while (queue.length > 0) {
+      const head = queue[0];
+      const currentMtime = getBundleMtime(head.build.out);
+      const worker = pool.pick(poolKey, currentMtime);
+      if (worker) {
+        queue.shift();
+        await assign(worker, head, true);
+        continue;
+      }
+      if (pool.canCreate(poolKey)) {
+        queue.shift();
+        await createAndAssign(head);
+        continue;
+      }
+      break;
+    }
+    if (queue.length === 0) waitQueues.delete(poolKey);
+  }
+
+  // Helper: an invocation finished on a pooled worker
+  function release(pooledWorkerID: string, requestID: string | undefined) {
+    const req = requestID ? requests.get(requestID) : undefined;
+    if (req) {
+      requests.delete(req.requestID);
+      trackRequestEnd(req.functionID);
+    }
+    const worker = pool.get(pooledWorkerID);
+    if (!worker) return;
+
+    logPool("RESPONSE", {
+      pooledWorkerID: pooledWorkerID.slice(0, 8),
+      functionID: req?.functionID ?? worker.functionID,
+      requestID: requestID?.slice(0, 8),
+      inFlight: worker.inFlight - 1,
+      durationMs: req ? Date.now() - req.startedAt : undefined,
+    });
+
+    const outcome = pool.checkin(worker);
+    if (outcome === "terminated") return; // stopPooledWorker drains
+    if (outcome === "idle") {
+      logPool("IDLE", {
         pooledWorkerID: pooledWorkerID.slice(0, 8),
         functionID: worker.functionID,
         poolKey: worker.poolKey.slice(0, 30),
-        poolSize: pool.length,
-        maxSize: POOL_SIZE,
+        idleTimeoutMs: IDLE_TIMEOUT,
       });
-      terminatePooledWorker(pooledWorkerID, "pool_full");
-      Logger.debug("Pool full, terminated worker", pooledWorkerID);
-      return;
     }
-
-    // Return to pool with idle timeout
-    worker.state = "idle";
-    worker.idleTimer = setTimeout(() => {
-      const idx = pool!.indexOf(worker);
-      if (idx >= 0) pool!.splice(idx, 1);
-      terminatePooledWorker(pooledWorkerID, "idle_timeout");
-      Logger.debug("Idle timeout, terminated worker", pooledWorkerID);
-    }, IDLE_TIMEOUT);
-
-    pool.push(worker);
-    activeWorkers.delete(pooledWorkerID);
-    logPool("RETURN_TO_POOL", {
-      pooledWorkerID: pooledWorkerID.slice(0, 8),
-      functionID: worker.functionID,
-      poolKey: worker.poolKey.slice(0, 30),
-      isSharedPool: worker.isSharedPool,
-      poolSizeAfter: pool.length,
-      idleTimeoutMs: IDLE_TIMEOUT,
-    });
-    Logger.debug(
-      "Returned worker to pool",
-      pooledWorkerID,
-      "pool key:",
-      worker.poolKey,
-      "pool size:",
-      pool.length
-    );
+    void drain(worker.poolKey);
   }
 
-  // Build success handler - clear pool for rebuilt function
+  // Build success handler - retire workers running the old code
   handlers.subscribe("function.build.success", async (evt) => {
-    const {functionID} = evt.properties;
+    const { functionID } = evt.properties;
     const props = useFunctions().fromID(functionID);
     if (!props) return;
 
-    // Get build to check if mono-build using global config
     const build = await builder.artifact(functionID);
     const isMonoBuild = build ? isMonoBuildPath(build.out) : false;
+    const poolKey = isMonoBuild ? `${props.runtime}:mono-build` : `${props.runtime}:${functionID}`;
+    const before = pool.workersFor(poolKey).length;
+    const marked = pool.invalidate(poolKey, isMonoBuild ? "mono-rebuild" : "rebuild");
 
-    if (isMonoBuild) {
-      // For mono-build: clear the entire shared pool since all functions share the same bundle
-      const sharedPoolKey = `${props.runtime}:mono-build`;
-      const sharedPool = workerPool.get(sharedPoolKey) || [];
-      const activeSharedCount = [...activeWorkers.values()].filter(
-        (w) => w.isSharedPool && w.poolKey === sharedPoolKey
-      ).length;
-
-      logPool("MONO_BUILD_CLEAR", {
-        functionID,
-        sharedPoolKey,
-        pooledWorkersCleared: sharedPool.length,
-        activeWorkersMarkedStale: activeSharedCount,
-      });
-
-      // Terminate all idle workers in the shared pool
-      for (const worker of sharedPool) {
-        clearTimeout(worker.idleTimer);
-        await terminatePooledWorker(worker.pooledWorkerID, "mono-rebuild");
-      }
-      workerPool.delete(sharedPoolKey);
-
-      // Mark active workers as stale (they'll be terminated after completing their request)
-      for (const [pooledID, worker] of activeWorkers) {
-        if (worker.isSharedPool && worker.poolKey === sharedPoolKey) {
-          staleWorkers.add(pooledID);
-          logPool("MARK_STALE", {
-            pooledWorkerID: pooledID.slice(0, 8),
-            functionID: worker.functionID,
-            reason: "mono-rebuild",
-          });
-        }
-      }
-    } else {
-      // For non-mono-build: clear pool for this specific function only
-      const pool = workerPool.get(`${props.runtime}:${functionID}`) || [];
-      const activeCount = [...activeWorkers.values()].filter(
-        (w) => w.functionID === functionID
-      ).length;
-
-      logPool("BUILD_CLEAR", {
-        functionID,
-        pooledWorkersCleared: pool.length,
-        activeWorkersMarkedStale: activeCount,
-      });
-
-      for (const worker of pool) {
-        clearTimeout(worker.idleTimer);
-        await terminatePooledWorker(worker.pooledWorkerID, "rebuild");
-      }
-      workerPool.delete(`${props.runtime}:${functionID}`);
-
-      // Mark active workers as stale (they'll be terminated after completing their request)
-      for (const [pooledID, worker] of activeWorkers) {
-        if (worker.functionID === functionID) {
-          staleWorkers.add(pooledID);
-          logPool("MARK_STALE", {
-            pooledWorkerID: pooledID.slice(0, 8),
-            functionID: worker.functionID,
-            reason: "rebuild",
-          });
-        }
-      }
-    }
+    logPool(isMonoBuild ? "MONO_BUILD_CLEAR" : "BUILD_CLEAR", {
+      functionID,
+      poolKey,
+      pooledWorkersCleared: before - marked.length,
+      activeWorkersMarkedStale: marked.length,
+    });
 
     // Stop non-pooled workers (legacy behavior)
     for (const [_, worker] of workers) {
@@ -523,8 +567,6 @@ export const useRuntimeWorkers = lazy(async () => {
       }
     }
   });
-
-  const lastRequestId = new Map<string, string>();
 
   // Main invocation handler
   bus.subscribe("function.invoked", async (evt) => {
@@ -539,22 +581,17 @@ export const useRuntimeWorkers = lazy(async () => {
     const startTime = Date.now();
     const requestPath = getRequestPath(event);
 
-    // Check if this is a warmup request - force-create new workers for these
-    // Matches the warmer format: { ding: true } or { warmer: true }
+    // Warm pings ({ding}/{warmer}) are ordinary invocations here: they take
+    // a pooled worker if one is free and wait for capacity otherwise, so a
+    // burst of them can never hold more isolates than the pool allows.
     const isWarmupRequest = event && typeof event === 'object' &&
       ('ding' in (event as any) || 'warmer' in (event as any) || (event as any).__sst_warmup === true);
-    const warmupId = isWarmupRequest ? ((event as any).warmupId ?? (event as any).index) : undefined;
 
     logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} RECEIVED func=${functionID.slice(-30)}`);
-
-    if (isWarmupRequest) {
-      logInvokeTrace("WARMUP_RECEIVED", requestID, `warmupId=${warmupId}`);
-    } else {
-      logInvokeTrace("INVOKE_RECEIVED", requestID, `func=${functionID.slice(-40)}`);
-    }
+    logInvokeTrace(isWarmupRequest ? "WARMUP_RECEIVED" : "INVOKE_RECEIVED", requestID, `func=${functionID.slice(-40)}`);
 
     // Send ack immediately
-    bus.publish("function.ack", {functionID, workerID: awsWorkerID, requestID});
+    bus.publish("function.ack", { functionID, workerID: awsWorkerID, requestID });
     logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} ACK sent elapsed=${Date.now() - startTime}ms`);
     logInvokeTrace("ACK_PUBLISHED", requestID, `elapsed=${Date.now() - startTime}ms`);
 
@@ -569,7 +606,7 @@ export const useRuntimeWorkers = lazy(async () => {
         errorType: "FunctionNotFound",
         errorMessage: `Function ${functionID} not found in project`,
         trace: [],
-    });
+      });
       return;
     }
 
@@ -588,12 +625,10 @@ export const useRuntimeWorkers = lazy(async () => {
       return;
     }
 
-    logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} Getting build artifact...`);
     logInvokeTrace("BUILD_ARTIFACT_START", requestID);
     const buildStartTime = Date.now();
     const build = await builder.artifact(functionID);
-    const buildElapsed = Date.now() - buildStartTime;
-    logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} Build artifact took ${buildElapsed}ms`);
+    logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} Build artifact took ${Date.now() - buildStartTime}ms`);
     logInvokeTrace("BUILD_ARTIFACT_DONE", requestID, build ? `out=${build.out.slice(-30)}` : "NO_BUILD");
     if (!build) {
       logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} ERROR: Build artifact not ready`);
@@ -609,201 +644,76 @@ export const useRuntimeWorkers = lazy(async () => {
       return;
     }
 
-    // Check if this runtime supports pooling
-    const poolable = isPoolableRuntime(props.runtime!, env);
-
-    if (poolable) {
+    if (isPoolableRuntime(props.runtime!, env)) {
       // === POOLED PATH ===
-      // Get pool key: shared for mono-build, per-function otherwise
-      const { key: poolKey, isShared } = getPoolKey(
+      const { key: poolKey, isShared } = getPoolKey(functionID, props.runtime!, build.out);
+      logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} Dispatching to pool ${poolKey.slice(0, 20)}`);
+      await dispatch({
+        evt,
+        props,
+        handler,
+        build,
+        poolKey,
+        isShared,
+        queuedAt: Date.now(),
+      });
+      return;
+    }
+
+    // === NON-POOLED PATH (existing behavior) ===
+    lastRequestId.set(awsWorkerID, requestID);
+
+    let worker = workers.get(awsWorkerID);
+    if (worker) return;
+
+    try {
+      await handler.startWorker({
+        ...build,
+        workerID: awsWorkerID,
         functionID,
-        props.runtime!,
-        build.out
-      );
+        environment: env,
+        url: `${serverConfig.url}/${awsWorkerID}/${serverConfig.API_VERSION}`,
+        runtime: props.runtime!,
+        isMonoBuild: isMonoBuildPath(build.out),
+      });
 
-      logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} Looking for pooled worker, poolKey=${poolKey.slice(0, 20)}`);
+      workers.set(awsWorkerID, { workerID: awsWorkerID, functionID });
+      bus.publish("worker.started", { workerID: awsWorkerID, functionID });
 
-      // For warmup requests, always create new workers (never reuse from pool)
-      let pooledWorker = isWarmupRequest ? undefined : getIdleWorker(poolKey, functionID, build.out);
-      let isReuse = false;
-
-      if (pooledWorker) {
-        isReuse = true;
-        // Update functionID for cross-function reuse (mono-build)
-        pooledWorker.functionID = functionID;
-        trackRequestStart(functionID, true);
-        logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} REUSING pooled worker ${pooledWorker.pooledWorkerID.slice(0, 8)}`);
-      } else {
-        // Create new pooled worker
-        const pooledWorkerID = crypto.randomBytes(16).toString("hex");
-        const bundleMtime = getBundleMtime(build.out);
-        pooledWorker = {
-          pooledWorkerID,
-          functionID,
-          state: "busy",
-          createdAt: Date.now(),
-          poolKey,
-          isSharedPool: isShared,
-          bundlePath: build.out,
-          bundleMtime,
-        };
-        logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} CREATING new pooled worker ${pooledWorkerID.slice(0, 8)}`);
-      }
-
-      // Set up mappings
-      workerIDMapping.set(awsWorkerID, pooledWorker.pooledWorkerID);
-      reverseMapping.set(pooledWorker.pooledWorkerID, awsWorkerID);
-      lastRequestId.set(pooledWorker.pooledWorkerID, requestID);
-      activeWorkers.set(pooledWorker.pooledWorkerID, pooledWorker);
-
-      if (!isReuse) {
-        // Start new worker with pooledWorkerID (cold start)
-        trackRequestStart(functionID, false);
-        const currentPoolSize = workerPool.get(poolKey)?.length || 0;
-        logPool(isWarmupRequest ? "WARMUP_CREATE" : "CREATE", {
-          pooledWorkerID: pooledWorker.pooledWorkerID.slice(0, 8),
-          functionID,
-          runtime: props.runtime,
-          requestID: requestID.slice(0, 8),
-          poolKey: poolKey.slice(0, 30),
-          isSharedPool: isShared,
-          currentPoolSize,
-          activeWorkers: activeWorkers.size,
-          ...(isWarmupRequest && { warmupId }),
-        });
-
-        logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} Starting worker ${pooledWorker.pooledWorkerID.slice(0, 8)}...`);
-        logInvokeTrace("WORKER_START", requestID, `pooled=${pooledWorker.pooledWorkerID.slice(0, 8)}`);
-        const workerStartTime = Date.now();
-        try {
-    await handler.startWorker({
-      ...build,
-            workerID: pooledWorker.pooledWorkerID,
-            functionID,
-            environment: env,
-            url: `${serverConfig.url}/${pooledWorker.pooledWorkerID}/${serverConfig.API_VERSION}`,
-      runtime: props.runtime!,
-            isMonoBuild: isShared,
-    });
-          startedWorkers.add(pooledWorker.pooledWorkerID);
-          const workerStartElapsed = Date.now() - workerStartTime;
-          logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} Worker started in ${workerStartElapsed}ms`);
-          logInvokeTrace("WORKER_STARTED", requestID);
-          logEventTrace("WORKER_START", {
-            requestID,
-            functionID,
-            workerID: pooledWorker.pooledWorkerID,
-            path: requestPath,
-            correlationId: getCorrelationId(event),
-            apiGwReqId: getApiGatewayRequestId(event),
-            elapsed: workerStartElapsed,
-            reused: false,
-    });
-
-    bus.publish("worker.started", {
-            workerID: awsWorkerID,
-            functionID,
-          });
-        } catch (ex: any) {
-          logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} ERROR: Failed to start worker: ${ex.message}`);
-          Logger.debug("Failed to start pooled worker", ex);
-          bus.publish("function.error", {
-            workerID: awsWorkerID,
-            functionID,
-            requestID,
-            errorType: "WorkerStartFailed",
-            errorMessage: `Failed to start pooled worker: ${ex.message}`,
-            trace: ex.stack?.split("\n") || [],
-          });
-          // Cleanup failed worker state
-          activeWorkers.delete(pooledWorker.pooledWorkerID);
-          startedWorkers.delete(pooledWorker.pooledWorkerID);
-          lastRequestId.delete(pooledWorker.pooledWorkerID);
-          workerIDMapping.delete(awsWorkerID);
-          reverseMapping.delete(pooledWorker.pooledWorkerID);
-          return;
-        }
-      } else {
-        logInvokeTrace("WORKER_REUSE", requestID, `pooled=${pooledWorker.pooledWorkerID.slice(0, 8)}`);
-        logEventTrace("WORKER_START", {
-          requestID,
-          functionID,
-          workerID: pooledWorker.pooledWorkerID,
-          path: requestPath,
-          correlationId: getCorrelationId(event),
-          apiGwReqId: getApiGatewayRequestId(event),
-          reused: true,
-    });
-        bus.publish("worker.reused", {
-          workerID: awsWorkerID,
-          functionID,
-          pooledWorkerID: pooledWorker.pooledWorkerID,
-        });
-      }
-
-      // Route invocation to the pooled worker
       const server = await getServer();
-      logWorkers(`path=${requestPath} reqId=${requestID.slice(0, 8)} Routing invocation to worker ${pooledWorker.pooledWorkerID.slice(0, 8)} elapsed=${Date.now() - startTime}ms`);
-      logInvokeTrace("ROUTE_INVOCATION", requestID);
-      server.routeInvocation(pooledWorker.pooledWorkerID, evt.properties);
-    } else {
-      // === NON-POOLED PATH (existing behavior) ===
-      lastRequestId.set(awsWorkerID, requestID);
-
-      let worker = workers.get(awsWorkerID);
-      if (worker) return;
-
-      try {
-        await handler.startWorker({
-          ...build,
-          workerID: awsWorkerID,
-          functionID,
-          environment: env,
-          url: `${serverConfig.url}/${awsWorkerID}/${serverConfig.API_VERSION}`,
-          runtime: props.runtime!,
-          isMonoBuild: isMonoBuildPath(build.out),
-        });
-
-        workers.set(awsWorkerID, {workerID: awsWorkerID, functionID});
-        bus.publish("worker.started", {workerID: awsWorkerID, functionID});
-
-        // Route invocation to the non-pooled worker
-        const server = await getServer();
-        server.routeInvocation(awsWorkerID, evt.properties);
-      } catch (ex: any) {
-        Logger.debug("Failed to start worker", ex);
-        bus.publish("function.error", {
-          workerID: awsWorkerID,
-          functionID,
-          requestID,
-          errorType: "WorkerStartFailed",
-          errorMessage: `Failed to start worker: ${ex.message}`,
-          trace: ex.stack?.split("\n") || [],
-        });
-        return;
-      }
+      server.routeInvocation(awsWorkerID, evt.properties);
+    } catch (ex: any) {
+      Logger.debug("Failed to start worker", ex);
+      bus.publish("function.error", {
+        workerID: awsWorkerID,
+        functionID,
+        requestID,
+        errorType: "WorkerStartFailed",
+        errorMessage: `Failed to start worker: ${ex.message}`,
+        trace: ex.stack?.split("\n") || [],
+      });
+      return;
     }
   });
 
+  const stats = () => {
+    const s = pool.stats();
+    return { workers: s.workers, inFlight: s.inFlight, queued: queuedCount() };
+  };
+  startMemorySampling(stats);
+
   // Process exit cleanup
   process.on("exit", () => {
-    // Log final metrics summary
     writeSessionEndSummary();
-
-    for (const pool of workerPool.values()) {
-      for (const worker of pool) {
-        clearTimeout(worker.idleTimer);
-      }
+    for (const worker of pool.all()) {
+      if (worker.idleTimer) clearTimeout(worker.idleTimer);
     }
   });
 
   return {
     fromID(workerID: string) {
-      // Check pooled workers first
-      const pooled = activeWorkers.get(workerID);
-      if (pooled) return {workerID, functionID: pooled.functionID};
-
-      // Check non-pooled workers
+      const pooled = pool.get(workerID);
+      if (pooled) return { workerID, functionID: pooled.functionID };
       return workers.get(workerID)!;
     },
 
@@ -811,35 +721,41 @@ export const useRuntimeWorkers = lazy(async () => {
       return lastRequestId.get(workerID);
     },
 
-    stdout(workerID: string, message: string) {
-      // Check pooled workers first
-      const pooled = activeWorkers.get(workerID);
+    /**
+     * Who a response belongs to. Pooled workers may hold several requests,
+     * so the request id decides; non-pooled workers are their own AWS worker.
+     */
+    resolveRequest(workerID: string, requestID?: string) {
+      const req = requestID ? requests.get(requestID) : undefined;
+      if (req) return { awsWorkerID: req.awsWorkerID, functionID: req.functionID };
+      const pooled = pool.get(workerID);
       if (pooled) {
-        const requestID = lastRequestId.get(workerID);
-        if (requestID) {
-          const trimmedMessage = message.trim();
-          // Log messages that contain [LOG] prefix
-          if (trimmedMessage.includes("[LOG]")) {
-            logEventTrace("WORKER_LOG", {
-              requestID,
-              functionID: pooled.functionID,
-              workerID,
-              message: trimmedMessage,
-            });
-          }
-          bus.publish("worker.stdout", {
-            workerID,
-            functionID: pooled.functionID,
-            message: trimmedMessage,
-            requestID,
-          });
-        }
-        return;
+        const last = lastRequestId.get(workerID);
+        const lastReq = last ? requests.get(last) : undefined;
+        return {
+          awsWorkerID: lastReq?.awsWorkerID ?? workerID,
+          functionID: lastReq?.functionID ?? pooled.functionID,
+        };
       }
+      const worker = workers.get(workerID);
+      if (!worker) return undefined;
+      return { awsWorkerID: workerID, functionID: worker.functionID };
+    },
 
-      // Check if this is a preWarm worker (started but not yet active)
-      if (startedWorkers.has(workerID)) {
-        // During preWarm, ignore output since there's no request context
+    stdout(workerID: string, message: string) {
+      const pooled = pool.get(workerID);
+      if (pooled) {
+        for (const chunk of splitAttributed(message)) {
+          const requestID = chunk.requestID ?? lastRequestId.get(workerID);
+          if (!requestID) continue;
+          const trimmed = chunk.text.trim();
+          if (!trimmed) continue;
+          const functionID = requests.get(requestID)?.functionID ?? pooled.functionID;
+          if (trimmed.includes("[LOG]")) {
+            logEventTrace("WORKER_LOG", { requestID, functionID, workerID, message: trimmed });
+          }
+          bus.publish("worker.stdout", { workerID, functionID, message: trimmed, requestID });
+        }
         return;
       }
 
@@ -849,7 +765,6 @@ export const useRuntimeWorkers = lazy(async () => {
 
       const trimmedMessage = message.trim();
       const requestID = lastRequestId.get(workerID);
-      // Log messages that contain [LOG] prefix
       if (trimmedMessage.includes("[LOG]") && requestID) {
         logEventTrace("WORKER_LOG", {
           requestID,
@@ -867,33 +782,30 @@ export const useRuntimeWorkers = lazy(async () => {
     },
 
     exited(workerID: string) {
-      // Check if pooled worker
-      if (activeWorkers.has(workerID) || startedWorkers.has(workerID)) {
-        const worker = activeWorkers.get(workerID);
-        if (worker) {
-          const uptime = Date.now() - worker.createdAt;
-          logPool("EXIT", {
-            pooledWorkerID: workerID.slice(0, 8),
-            functionID: worker.functionID,
-            state: worker.state,
-            uptimeMs: uptime,
-          });
-
-          // Clean up all mappings
-          const awsWorkerID = reverseMapping.get(workerID);
-          if (awsWorkerID) {
-            workerIDMapping.delete(awsWorkerID);
-          }
-          reverseMapping.delete(workerID);
-          activeWorkers.delete(workerID);
-          lastRequestId.delete(workerID);
-          startedWorkers.delete(workerID);
-
-          bus.publish("worker.exited", {
-            workerID: awsWorkerID || workerID,
-            functionID: worker.functionID,
-          });
-        }
+      const pooled = pool.get(workerID);
+      if (pooled) {
+        logPool("EXIT", {
+          pooledWorkerID: workerID.slice(0, 8),
+          functionID: pooled.functionID,
+          inFlight: pooled.inFlight,
+          uptimeMs: Date.now() - pooled.createdAt,
+        });
+        pool.remove(pooled);
+        const last = lastRequestId.get(workerID);
+        const awsWorkerID = last ? requests.get(last)?.awsWorkerID : undefined;
+        // Anything it was holding will never get a response from it
+        failRequestsOn(
+          workerID,
+          "WorkerExited",
+          "Local worker exited before responding (out of memory or crashed). Check the dev console for details."
+        );
+        lastRequestId.delete(workerID);
+        bus.publish("worker.exited", {
+          workerID: awsWorkerID ?? workerID,
+          functionID: pooled.functionID,
+          pooledWorkerID: workerID,
+        });
+        void drain(pooled.poolKey);
         return;
       }
 
@@ -905,31 +817,18 @@ export const useRuntimeWorkers = lazy(async () => {
       bus.publish("worker.exited", existing);
     },
 
-    // Called by server when response is received - returns worker to pool
-    onResponse(pooledWorkerID: string) {
-      if (activeWorkers.has(pooledWorkerID)) {
-        const worker = activeWorkers.get(pooledWorkerID);
-        if (worker) {
-          trackRequestEnd(worker.functionID);
-          logPool("RESPONSE", {
-            pooledWorkerID: pooledWorkerID.slice(0, 8),
-            functionID: worker.functionID,
-            requestID: lastRequestId.get(pooledWorkerID)?.slice(0, 8),
-          });
-        }
-        returnToPool(pooledWorkerID);
-      }
-    },
-
-    // Get AWS workerID from pooled ID (for IoT routing)
-    getAwsWorkerID(pooledWorkerID: string): string | undefined {
-      return reverseMapping.get(pooledWorkerID);
+    // Called by server when a response or error is received
+    onResponse(pooledWorkerID: string, requestID?: string) {
+      if (!pool.get(pooledWorkerID)) return;
+      release(pooledWorkerID, requestID ?? lastRequestId.get(pooledWorkerID));
     },
 
     // Check if worker is pooled
     isPooled(workerID: string): boolean {
-      return activeWorkers.has(workerID) || startedWorkers.has(workerID);
+      return pool.get(workerID) !== undefined;
     },
+
+    stats,
 
     subscribe: bus.forward(
       "worker.started",
@@ -940,11 +839,19 @@ export const useRuntimeWorkers = lazy(async () => {
     ),
 
     /**
-     * Trigger warmup by invoking Lambda functions with warmup payloads.
-     * This sends real requests through the IoT bridge, which naturally creates workers.
-     * @param count Number of workers to warm up (default: 15)
+     * Warm the pool by invoking a Node function with warm pings.
+     *
+     * Each ping is marked as a fan-out *child* (`__WARMER_INVOCATION__ > 1`)
+     * so the app's lambda-warmer preloads its handlers and returns instead of
+     * fanning out to `concurrency` more Lambdas, which is what turned the old
+     * 30 pings into ~900 worker creations. The count is capped at the pool
+     * size, and pings go through the normal pool path, so warmup can never
+     * hold more isolates than steady state.
      */
-    async triggerWarmup(count: number = 15) {
+    async triggerWarmup(count: number) {
+      count = Math.min(count, POOL_SIZE);
+      if (count <= 0) return { warmed: 0 };
+
       const functions = useFunctions();
       const allFunctions = functions.all;
 
@@ -961,20 +868,13 @@ export const useRuntimeWorkers = lazy(async () => {
       }
 
       if (!targetFunction) {
-        logPool("WARMUP_SKIP", {
-          reason: "no nodejs function found",
-        });
+        logPool("WARMUP_SKIP", { reason: "no nodejs function found" });
         return { warmed: 0 };
       }
 
       const { functionName } = targetFunction;
 
-      logPool("WARMUP_START", {
-        count,
-        functionName,
-      });
-
-      // Publish warmup start event
+      logPool("WARMUP_START", { count, functionName });
       bus.publish("warmup.start", { count });
 
       const startTime = Date.now();
@@ -982,76 +882,38 @@ export const useRuntimeWorkers = lazy(async () => {
       let failed = 0;
       let completed = 0;
 
-      // Use the shared AWS client
       const { useAWSClient } = await import("../credentials.js");
       const { LambdaClient, InvokeCommand } = await import("@aws-sdk/client-lambda");
       const lambda = useAWSClient(LambdaClient);
 
-      // Helper to publish progress
       const publishProgress = () => {
-        bus.publish("warmup.progress", {
-          completed,
-          total: count,
-          success,
-          failed,
-        });
+        bus.publish("warmup.progress", { completed, total: count, success, failed });
       };
 
-      // Phase 1: Invoke first warmup to populate V8 compile cache
-      try {
-        const result = await lambda.send(
-          new InvokeCommand({
-            FunctionName: functionName,
-            InvocationType: "RequestResponse",
-            Payload: JSON.stringify({
-              ding: true,
-              concurrency: count,
-              index: 0,
-            }),
-          })
-        );
-        if (result.StatusCode === 200) {
-          success++;
-        } else {
-          failed++;
-        }
-      } catch (ex: any) {
-        failed++;
-      }
-      completed++;
-      publishProgress();
-
-      // Phase 2: Invoke remaining warmups in parallel
-      if (count > 1) {
-        const results = await Promise.all(
-          Array.from({ length: count - 1 }, (_, i) => i + 1).map(async (i) => {
-            try {
-              const result = await lambda.send(
-                new InvokeCommand({
-                  FunctionName: functionName,
-                  InvocationType: "RequestResponse",
-                  Payload: JSON.stringify({
-                    ding: true,
-                    concurrency: count,
-                    index: i,
-                  }),
-                })
-              );
-              const ok = result.StatusCode === 200;
-              if (ok) success++;
-              else failed++;
-              completed++;
-              publishProgress();
-              return ok;
-            } catch {
-              failed++;
-              completed++;
-              publishProgress();
-              return false;
-            }
-          })
-        );
-      }
+      await Promise.all(
+        Array.from({ length: count }, (_, i) => i).map(async (i) => {
+          try {
+            const result = await lambda.send(
+              new InvokeCommand({
+                FunctionName: functionName,
+                InvocationType: "RequestResponse",
+                Payload: JSON.stringify({
+                  ding: true,
+                  __WARMER_INVOCATION__: i + 2,
+                  __WARMER_CONCURRENCY__: count + 1,
+                  __WARMER_CORRELATIONID__: `sst-dev-warmup-${startTime}`,
+                }),
+              })
+            );
+            if (result.StatusCode === 200) success++;
+            else failed++;
+          } catch {
+            failed++;
+          }
+          completed++;
+          publishProgress();
+        })
+      );
 
       const elapsed = Date.now() - startTime;
       logPool("WARMUP_DONE", {
@@ -1060,13 +922,7 @@ export const useRuntimeWorkers = lazy(async () => {
         elapsedMs: elapsed,
         avgMs: success > 0 ? Math.round(elapsed / success) : 0,
       });
-
-      // Publish warmup complete event
-      bus.publish("warmup.complete", {
-        success,
-        failed,
-        elapsedMs: elapsed,
-      });
+      bus.publish("warmup.complete", { success, failed, elapsedMs: elapsed });
 
       return { warmed: success, elapsed };
     },
