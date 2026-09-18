@@ -230,6 +230,41 @@ function isPoolableRuntime(
   );
 }
 
+/**
+ * Resolve once `.mono-build/.last-rebuild` exists and has not changed for
+ * `quietMs`. No-op when mono-build is off. Gives up after `maxWaitMs`.
+ *
+ * Dev start writes the timestamp twice about 7s apart (the app's initial
+ * rebuild, then the watcher's first pass), so the quiet window has to be
+ * longer than that gap or the warm worker is retired as stale right away.
+ */
+async function waitForStableBundle(quietMs = 10_000, maxWaitMs = 120_000) {
+  const config = useMonoBuildConfig();
+  const timestampFile = path.join(config.dir, ".last-rebuild");
+  const started = Date.now();
+  let last: string | undefined;
+  let lastChange = Date.now();
+  while (Date.now() - started < maxWaitMs) {
+    if (!config.enabled) {
+      // Not (yet) a mono-build project; nothing to wait for unless it appears
+      if (Date.now() - started > quietMs) return;
+    } else {
+      let current: string | undefined;
+      try {
+        current = fs.readFileSync(timestampFile, "utf-8");
+      } catch {}
+      if (current !== last) {
+        last = current;
+        lastChange = Date.now();
+      } else if (current !== undefined && Date.now() - lastChange >= quietMs) {
+        return;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  logPool("WARMUP_BUNDLE_TIMEOUT", { waitedMs: Date.now() - started });
+}
+
 /** Only the Node runtime shim knows how to run invocations side by side. */
 function concurrencyFor(runtime: string): number {
   return runtime.startsWith("nodejs") ? WORKER_CONCURRENCY : 1;
@@ -840,18 +875,25 @@ export const useRuntimeWorkers = lazy(async () => {
     ),
 
     /**
-     * Warm the pool by invoking a Node function with warm pings.
+     * Warm `workersToWarm` pooled workers by invoking a Node function with
+     * concurrent warm pings.
      *
      * Each ping is marked as a fan-out *child* (`__WARMER_INVOCATION__ > 1`)
      * so the app's lambda-warmer preloads its handlers and returns instead of
      * fanning out to `concurrency` more Lambdas, which is what turned the old
-     * 30 pings into ~900 worker creations. The count is capped at the pool
-     * size, and pings go through the normal pool path, so warmup can never
-     * hold more isolates than steady state.
+     * 30 pings into ~900 worker creations. Pings go through the normal pool
+     * path, so warmup can never hold more isolates than steady state.
+     *
+     * In mono-build mode this waits for the bundle to settle first: dev start
+     * kicks off the bundle's first watch build, and a worker loaded before it
+     * lands is retired as stale seconds later, which wasted every warm worker.
      */
-    async triggerWarmup(count: number) {
-      count = Math.min(count, POOL_SIZE);
-      if (count <= 0) return { warmed: 0 };
+    async triggerWarmup(workersToWarm: number) {
+      workersToWarm = Math.min(workersToWarm, POOL_SIZE);
+      if (workersToWarm <= 0) return { warmed: 0 };
+      const count = workersToWarm * WORKER_CONCURRENCY;
+
+      await waitForStableBundle();
 
       const functions = useFunctions();
       const allFunctions = functions.all;
@@ -875,7 +917,7 @@ export const useRuntimeWorkers = lazy(async () => {
 
       const { functionName } = targetFunction;
 
-      logPool("WARMUP_START", { count, functionName });
+      logPool("WARMUP_START", { count, workersToWarm, functionName });
       bus.publish("warmup.start", { count });
 
       const startTime = Date.now();

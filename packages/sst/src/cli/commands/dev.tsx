@@ -535,7 +535,7 @@ export const dev = (program: Program) =>
           useFunctionLogger(),
         ]);
 
-        // Warm the pool through the real request flow. SST_WARMUP_COUNT=0
+        // Warm SST_WARMUP_COUNT workers through the real request flow. 0
         // turns this off; the count is capped at the pool size so warmup can
         // never hold more isolates than steady state would.
         const {WARMUP_COUNT} = await import("../../runtime/worker-config.js");

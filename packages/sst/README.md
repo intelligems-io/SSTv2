@@ -51,7 +51,7 @@ control it (defaults in `src/runtime/worker-config.ts`):
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SST_WORKER_POOL_SIZE` | `4` | Max live workers per pool (one shared pool for all mono-build Node functions). Requests beyond that wait for a free worker instead of spawning a new one. |
-| `SST_WORKER_CONCURRENCY` | `5` | Invocations one Node worker runs at the same time. Each invocation gets its own `process.env`. Set to `1` to fall back to one request per worker. |
+| `SST_WORKER_CONCURRENCY` | `10` | Invocations one Node worker runs at the same time. Each invocation gets its own `process.env`. Set to `1` to fall back to one request per worker. |
 | `SST_WORKER_IDLE_TIMEOUT` | `300000` | Milliseconds an idle worker is kept before it is terminated. |
 | `SST_WARMUP_COUNT` | pool size | Warm pings sent at startup (capped at the pool size). `0` disables warmup. |
 | `SST_WORKER_MAX_HEAP_MB` | `1024` | V8 old-space cap per worker. A worker that exceeds it exits and its in-flight requests fail; the dev session keeps running. `0` removes the cap. |

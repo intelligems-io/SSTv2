@@ -1,6 +1,7 @@
 import esbuild from "esbuild";
 import fs from "fs/promises";
 import path from "path";
+import crypto from "crypto";
 import { dynamicImport } from "../util/module.js";
 import { findAbove } from "../util/fs.js";
 import { VisibleError } from "../error.js";
@@ -17,6 +18,17 @@ declare module "../bus.js" {
     };
   }
 }
+
+/**
+ * The last config module we imported, keyed by the hash of its bundled
+ * source. An ES module can never be unloaded, so every `import()` of a fresh
+ * `.sst.config.<time>.mjs` stays in memory for the life of `sst dev`. Dev
+ * rebuilds the config on every change to a file inside its bundle (all the
+ * stack code), so reuse the module when the bundle did not actually change.
+ */
+let cached:
+  | { hash: string; metafile: esbuild.Metafile; mod: any; shallow: boolean }
+  | undefined;
 
 export async function load(input: string, shallow?: boolean) {
   const parsed = path.parse(input);
@@ -89,6 +101,7 @@ export async function load(input: string, shallow?: boolean) {
       ],
       absWorkingDir: root,
       outfile,
+      write: false,
       banner: {
         js: [
           `import { createRequire as topLevelCreateRequire } from 'module';`,
@@ -106,12 +119,18 @@ export async function load(input: string, shallow?: boolean) {
       //  },
       entryPoints: [input],
     });
-    // Logger.debug("built", input);
+    const output = result.outputFiles?.find((f) => f.path === outfile) ?? result.outputFiles?.[0];
+    if (!output) throw new VisibleError("Config build produced no output");
+    const hash = crypto.createHash("sha256").update(output.contents).digest("hex");
+    if (cached && cached.hash === hash && cached.shallow === Boolean(shallow)) {
+      return [cached.metafile, cached.mod] as const;
+    }
+    await fs.writeFile(outfile, output.contents);
     const mod = await dynamicImport(outfile);
-    // Logger.debug("imported", input);
     await fs.rm(outfile, {
       force: true,
     });
+    cached = { hash, metafile: result.metafile, mod: mod.default, shallow: Boolean(shallow) };
     if (!mod.default?.config)
       throw new VisibleError(
         `The config file is improperly formatted.`,

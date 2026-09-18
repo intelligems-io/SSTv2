@@ -47,12 +47,12 @@ describe("WorkerPool", () => {
     expect(pool.canCreate(a.poolKey)).toBe(true);
   });
 
-  it("picks the least loaded worker with spare capacity", () => {
+  it("packs into the busiest worker that still has capacity", () => {
     const pool = new WorkerPool({ maxWorkers: 5, idleTimeoutMs: 1000, onTerminate: vi.fn() });
     pool.add(worker("full", { inFlight: 2 }));
     pool.add(worker("busy", { inFlight: 1 }));
     pool.add(worker("idle", { inFlight: 0 }));
-    expect(pool.pick("nodejs:mono-build")?.id).toBe("idle");
+    expect(pool.pick("nodejs:mono-build")?.id).toBe("busy");
   });
 
   it("returns undefined when every worker is saturated", () => {

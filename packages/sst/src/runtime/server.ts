@@ -9,6 +9,7 @@ import { lazy } from "../util/lazy.js";
 import { getRequestPath } from "./request-utils.js";
 import { logServer } from "./debug-bridge-logging.js";
 import { logEventTrace } from "./event-trace-logging.js";
+import { applyDevEnvOverrides } from "./dev-env-overrides.js";
 
 export const useRuntimeServerConfig = lazy(async () => {
   const port = await getPort({
@@ -164,7 +165,8 @@ export const useRuntimeServer = lazy(async () => {
       // This prevents env leakage when workers are reused across different functions
       res.json({
         event: payload.event,
-        env: payload.env,
+        // The dev process's own axes win over what the stub forwarded.
+        env: applyDevEnvOverrides(payload.env),
       });
     }
   );

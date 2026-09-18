@@ -86,9 +86,12 @@ export class WorkerPool {
   }
 
   /**
-   * Least-loaded live worker with spare capacity, or undefined. Workers whose
-   * bundle is older than `currentMtime` are retired on the way: idle ones now,
-   * busy ones once they drain.
+   * The busiest live worker that still has spare capacity, or undefined.
+   * Packing invocations into as few workers as possible is what keeps memory
+   * down: every worker that serves traffic grows to hold the handlers it has
+   * loaded, so an idle spare is a few hundred MB doing nothing. Workers whose
+   * bundle is older than `currentMtime` are retired on the way: idle ones
+   * now, busy ones once they drain.
    */
   pick(poolKey: string, currentMtime?: number): PoolWorker | undefined {
     const pool = this.pools.get(poolKey);
@@ -109,7 +112,7 @@ export class WorkerPool {
     for (const worker of pool) {
       if (worker.stale) continue;
       if (worker.inFlight >= worker.maxConcurrency) continue;
-      if (!best || worker.inFlight < best.inFlight) best = worker;
+      if (!best || worker.inFlight > best.inFlight) best = worker;
     }
     return best;
   }

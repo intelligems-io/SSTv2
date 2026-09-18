@@ -179,12 +179,20 @@ export async function useLocalServer(opts: Opts) {
     }[];
   }
 
+  // Replayed to console clients on connect. Bounded: every entry keeps its
+  // full event payload and every log line, so an unbounded list grows for the
+  // life of the dev session.
+  const MAX_INVOCATIONS = 200;
   let invocations: Invocation[] = [];
   function publish(invocation: Invocation) {
     const index = invocations.findLastIndex((i) => i.id === invocation.id);
 
-    if (index < 0) invocations.push(invocation);
-    else invocations[index] = invocation;
+    if (index < 0) {
+      invocations.push(invocation);
+      if (invocations.length > MAX_INVOCATIONS) {
+        invocations.splice(0, invocations.length - MAX_INVOCATIONS);
+      }
+    } else invocations[index] = invocation;
 
     const json = JSON.stringify({
       type: "invocation",

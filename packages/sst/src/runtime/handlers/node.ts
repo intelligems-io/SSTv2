@@ -16,6 +16,7 @@ import { lazy } from "../../util/lazy.js";
 import {useMonoBuildConfig} from "../mono-build-config.js";
 import { SOURCE_MAPS, WORKER_MAX_HEAP_MB } from "../worker-config.js";
 import { forgetWorkerMemory, recordWorkerMemory } from "../memory-logging.js";
+import { applyDevEnvOverrides } from "../dev-env-overrides.js";
 
 export const useNodeHandler = (): RuntimeHandler => {
   const rebuildCache: Record<
@@ -52,7 +53,7 @@ export const useNodeHandler = (): RuntimeHandler => {
         ),
         {
           env: {
-            ...input.environment,
+            ...applyDevEnvOverrides(input.environment),
             IS_LOCAL: "true",
           },
           // Source maps cost memory in every isolate; opt in with SST_SOURCE_MAPS=true
