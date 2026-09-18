@@ -1,18 +1,15 @@
 import { createDebugFileLogger, DebugFileLogger } from "./debug-file-logger.js";
 
-// Configuration
-const SST_BUILD_CONCURRENCY = parseInt(
-  process.env.SST_BUILD_CONCURRENCY || "4",
-  10
-);
-export const POOL_SIZE = parseInt(
-  process.env.SST_WORKER_POOL_SIZE || "10",
-  10
-);
-export const IDLE_TIMEOUT = parseInt(
-  process.env.SST_WORKER_IDLE_TIMEOUT || "60000",
-  10
-);
+import {
+  BUILD_CONCURRENCY as SST_BUILD_CONCURRENCY,
+  IDLE_TIMEOUT,
+  POOL_SIZE,
+  WORKER_CONCURRENCY,
+} from "./worker-config.js";
+import { memorySummary } from "./memory-logging.js";
+
+export { POOL_SIZE, IDLE_TIMEOUT };
+
 const DEBUG_POOL = process.env.SST_DEBUG_POOL === "true";
 const DEBUG_POOL_FILE =
   process.env.SST_DEBUG_POOL_FILE || ".sst/worker-pool.log";
@@ -48,7 +45,7 @@ function getPoolLogger(): DebugFileLogger | null {
     poolLogger = createDebugFileLogger({
       filePath: DEBUG_POOL_FILE,
       sessionName: "POOL",
-      sessionHeader: `POOL_SIZE=${POOL_SIZE} IDLE_TIMEOUT=${IDLE_TIMEOUT}ms BUILD_CONCURRENCY=${SST_BUILD_CONCURRENCY}`,
+      sessionHeader: `POOL_SIZE=${POOL_SIZE} IDLE_TIMEOUT=${IDLE_TIMEOUT}ms CONCURRENCY=${WORKER_CONCURRENCY} BUILD_CONCURRENCY=${SST_BUILD_CONCURRENCY}`,
       width: 100,
     });
   }
@@ -215,6 +212,7 @@ export function writeSessionEndSummary() {
     const funcName = getFunctionName(funcID);
     summary += `  ${funcName.padEnd(25)} total=${total} poolHits=${hits} coldStarts=${cold} peakConcurrent=${peak} hitRate=${hitRate}%\n`;
   }
+  summary += memorySummary();
 
   logger.close(summary);
 }

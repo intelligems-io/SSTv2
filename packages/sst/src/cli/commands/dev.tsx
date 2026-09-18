@@ -535,12 +535,16 @@ export const dev = (program: Program) =>
           useFunctionLogger(),
         ]);
 
-        // Trigger warmup by invoking Lambda functions with warmup payloads
-        // This creates workers through the real request flow
-        import("../../runtime/workers.js").then(async (mod) => {
-          const workers = await mod.useRuntimeWorkers();
-          await workers.triggerWarmup(30);
-        });
+        // Warm the pool through the real request flow. SST_WARMUP_COUNT=0
+        // turns this off; the count is capped at the pool size so warmup can
+        // never hold more isolates than steady state would.
+        const {WARMUP_COUNT} = await import("../../runtime/worker-config.js");
+        if (WARMUP_COUNT > 0) {
+          import("../../runtime/workers.js").then(async (mod) => {
+            const workers = await mod.useRuntimeWorkers();
+            await workers.triggerWarmup(WARMUP_COUNT);
+          });
+        }
       } catch (e: any) {
         await exitWithError(e);
       }

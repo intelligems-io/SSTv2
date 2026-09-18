@@ -27,10 +27,10 @@ export const useRuntimeServer = lazy(async () => {
   const workers = await useRuntimeWorkers();
   const cfg = await useRuntimeServerConfig();
 
-  const workersWaiting = new Map<
-    string,
-    (evt: Events["function.invoked"]) => void
-  >();
+  type Resolve = (evt: Events["function.invoked"]) => void;
+  // A worker running several invocations at once has several /next calls
+  // outstanding, so each worker keeps a list of waiting resolvers.
+  const workersWaiting = new Map<string, Resolve[]>();
   const invocationsQueued = new Map<string, Events["function.invoked"][]>();
 
   function next(workerID: string) {
@@ -38,8 +38,13 @@ export const useRuntimeServer = lazy(async () => {
     const value = queue?.shift();
     if (value) return value;
 
-    return new Promise<Events["function.invoked"]>((resolve, reject) => {
-      workersWaiting.set(workerID, resolve);
+    return new Promise<Events["function.invoked"]>((resolve) => {
+      let waiting = workersWaiting.get(workerID);
+      if (!waiting) {
+        waiting = [];
+        workersWaiting.set(workerID, waiting);
+      }
+      waiting.push(resolve);
     });
   }
 
@@ -51,9 +56,8 @@ export const useRuntimeServer = lazy(async () => {
     const requestPath = getRequestPath(invocation.event);
     const requestID = invocation.requestID;
 
-    const waiting = workersWaiting.get(targetWorkerID);
+    const waiting = workersWaiting.get(targetWorkerID)?.shift();
     if (waiting) {
-      workersWaiting.delete(targetWorkerID);
       logServer(`path=${requestPath} reqId=${requestID.slice(0, 8)} Worker ${targetWorkerID.slice(0, 8)} was waiting, delivering immediately`);
       waiting(invocation);
       return;
@@ -69,9 +73,10 @@ export const useRuntimeServer = lazy(async () => {
   }
 
   workers.subscribe("worker.exited", async (evt) => {
-    const waiting = workersWaiting.get(evt.properties.workerID);
-    if (!waiting) return;
-    workersWaiting.delete(evt.properties.workerID);
+    // Pooled workers are keyed by their pooled id here, not the AWS worker id
+    const id = evt.properties.pooledWorkerID ?? evt.properties.workerID;
+    workersWaiting.delete(id);
+    invocationsQueued.delete(id);
   });
 
   // Note: function.invoked routing is handled by workers.ts via routeInvocation()
@@ -86,21 +91,16 @@ export const useRuntimeServer = lazy(async () => {
     }),
     async (req, res) => {
       const pooledWorkerID = req.params.workerID;
-      const worker = workers.fromID(pooledWorkerID);
-      if (!worker) {
+      const requestID = workers.getCurrentRequestID(pooledWorkerID);
+      const target = workers.resolveRequest(pooledWorkerID, requestID);
+      if (!target) {
         res.status(404).send();
         return;
       }
 
-      // Get AWS workerID for IoT routing (if pooled)
-      const awsWorkerID = workers.isPooled(pooledWorkerID)
-        ? workers.getAwsWorkerID(pooledWorkerID) || pooledWorkerID
-        : pooledWorkerID;
-
-      const requestID = workers.getCurrentRequestID(pooledWorkerID);
       logEventTrace("WORKER_END", {
         requestID: requestID || "unknown",
-        functionID: worker.functionID,
+        functionID: target.functionID,
         workerID: pooledWorkerID,
         status: "error",
         errorType: req.body?.errorType || "init_error",
@@ -108,13 +108,12 @@ export const useRuntimeServer = lazy(async () => {
 
       bus.publish("function.error", {
         requestID,
-        workerID: awsWorkerID,
-        functionID: worker.functionID,
+        workerID: target.awsWorkerID,
+        functionID: target.functionID,
         ...req.body,
       });
 
-      // Return pooled worker to pool
-      workers.onResponse(pooledWorkerID);
+      workers.onResponse(pooledWorkerID, requestID);
 
       res.json("ok");
     }
@@ -188,34 +187,28 @@ export const useRuntimeServer = lazy(async () => {
       logServer(`reqId=${requestID.slice(0, 8)} Worker ${pooledWorkerID.slice(0, 8)} posting /response`);
       Logger.debug("Worker", pooledWorkerID, "got response", req.body);
 
-      const worker = workers.fromID(pooledWorkerID);
-      if (!worker) {
+      const target = workers.resolveRequest(pooledWorkerID, requestID);
+      if (!target) {
         logServer(`reqId=${requestID.slice(0, 8)} ERROR: Worker ${pooledWorkerID.slice(0, 8)} not found`);
         res.status(404).send();
         return;
       }
 
-      // Get AWS workerID for IoT routing (if pooled)
-      const awsWorkerID = workers.isPooled(pooledWorkerID)
-        ? workers.getAwsWorkerID(pooledWorkerID) || pooledWorkerID
-        : pooledWorkerID;
-
-      logServer(`reqId=${requestID.slice(0, 8)} Publishing function.success awsWorkerID=${awsWorkerID.slice(0, 8)}`);
+      logServer(`reqId=${requestID.slice(0, 8)} Publishing function.success awsWorkerID=${target.awsWorkerID.slice(0, 8)}`);
       logEventTrace("WORKER_END", {
         requestID,
-        functionID: worker.functionID,
+        functionID: target.functionID,
         workerID: pooledWorkerID,
         status: "success",
       });
       bus.publish("function.success", {
-        workerID: awsWorkerID,
-        functionID: worker.functionID,
+        workerID: target.awsWorkerID,
+        functionID: target.functionID,
         requestID: requestID,
         body: req.body,
       });
 
-      // Return pooled worker to pool
-      workers.onResponse(pooledWorkerID);
+      workers.onResponse(pooledWorkerID, requestID);
 
       res.status(202).send();
     }
@@ -285,37 +278,31 @@ export const useRuntimeServer = lazy(async () => {
     }),
     (req, res) => {
       const pooledWorkerID = req.params.workerID;
-      const worker = workers.fromID(pooledWorkerID);
-      if (!worker) {
+      const requestID = req.params.awsRequestId;
+      const target = workers.resolveRequest(pooledWorkerID, requestID);
+      if (!target) {
         res.status(404).send();
         return;
       }
 
-      // Get AWS workerID for IoT routing (if pooled)
-      const awsWorkerID = workers.isPooled(pooledWorkerID)
-        ? workers.getAwsWorkerID(pooledWorkerID) || pooledWorkerID
-        : pooledWorkerID;
-
-      const requestID = req.params.awsRequestId;
       logEventTrace("WORKER_END", {
         requestID,
-        functionID: worker.functionID,
+        functionID: target.functionID,
         workerID: pooledWorkerID,
         status: "error",
         errorType: req.body.errorType,
       });
 
       bus.publish("function.error", {
-        workerID: awsWorkerID,
-        functionID: worker.functionID,
+        workerID: target.awsWorkerID,
+        functionID: target.functionID,
         errorType: req.body.errorType,
         errorMessage: req.body.errorMessage,
         requestID,
         trace: req.body.trace,
       });
 
-      // Return pooled worker to pool
-      workers.onResponse(pooledWorkerID);
+      workers.onResponse(pooledWorkerID, requestID);
 
       res.status(202).send();
     }
