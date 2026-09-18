@@ -187,6 +187,7 @@ const POOLABLE_RUNTIMES = new Set([
   "nodejs18.x",
   "nodejs20.x",
   "nodejs22.x",
+  "nodejs24.x",
   // Python - has while True loop in python-runtime/runtime.py
   "python",
   "python3.7",
