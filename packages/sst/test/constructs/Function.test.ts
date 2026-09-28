@@ -52,7 +52,7 @@ test("handlerPath: entry", async () => {
   });
   await app.finish();
   hasResource(stack, "AWS::Lambda::Function", {
-    Handler: "index.handler",
+    Handler: "lambda.handler",
   });
 });
 

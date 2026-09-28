@@ -48,12 +48,7 @@ export class Stack extends CDKStack {
    */
   public readonly defaultFunctionProps: FunctionProps[];
 
-  /**
-   * Create a custom resource handler per stack. This handler will
-   * be used by all the custom resources in the stack.
-   * @internal
-   */
-  public readonly customResourceHandler: lambda.Function;
+  private _customResourceHandler?: lambda.Function;
 
   /**
    * Skip building Function/Site code when stack is not active
@@ -82,10 +77,20 @@ export class Stack extends CDKStack {
     this.defaultFunctionProps = app.defaultFunctionProps.map((dfp) =>
       typeof dfp === "function" ? dfp(this) : dfp
     );
-    this.customResourceHandler = this.createCustomResourceHandler();
     this.isActive =
       app.mode !== "remove" &&
       (!app.isActiveStack || app.isActiveStack?.(this.stackName) === true);
+  }
+
+  /**
+   * The custom resource handler shared by every SST custom resource in the
+   * stack. It is created on first access, so a stack without SST custom
+   * resources deploys no handler Lambda and no execution role for it.
+   * @internal
+   */
+  public get customResourceHandler(): lambda.Function {
+    this._customResourceHandler ??= this.createCustomResourceHandler();
+    return this._customResourceHandler;
   }
 
   /**
