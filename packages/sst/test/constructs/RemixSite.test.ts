@@ -83,7 +83,7 @@ test("default", async () => {
   expect(site.cdk!.distribution.distributionDomainName).toBeDefined();
   expect(site.cdk!.certificate).toBeUndefined();
   countResources(stack, "AWS::S3::Bucket", 1);
-  countResources(stack, "AWS::Lambda::Function", 4);
+  countResources(stack, "AWS::Lambda::Function", 5); // includes the stack custom resource handler
   countResources(stack, "AWS::CloudFront::Distribution", 1);
   hasResource(stack, "AWS::CloudFront::Distribution", {
     DistributionConfig: {
@@ -318,7 +318,7 @@ test("edge: true", async () => {
   expect(site.cdk!.distribution.distributionDomainName).toBeDefined();
   expect(site.cdk!.certificate).toBeUndefined();
   countResources(stack, "AWS::S3::Bucket", 1);
-  countResources(stack, "AWS::Lambda::Function", 5);
+  countResources(stack, "AWS::Lambda::Function", 6); // includes the stack custom resource handler
   countResources(stack, "AWS::CloudFront::Distribution", 1);
   hasResource(stack, "AWS::CloudFront::Distribution", {
     DistributionConfig: {

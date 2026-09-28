@@ -3,7 +3,8 @@ import { test, expect } from "vitest";
 
 import { hasOutput, hasNoOutput, countResources, createApp } from "./helper";
 import * as cdk from "aws-cdk-lib";
-import { App, Stack, Api } from "../../dist/constructs/";
+import { Template } from "aws-cdk-lib/assertions";
+import { App, Stack, Api, Function } from "../../dist/constructs/";
 
 test("scope-Stage", async () => {
   const app = await createApp();
@@ -108,4 +109,32 @@ test("isActive: remove mode", async () => {
   });
   const stack = new Stack(app, "stack");
   expect(stack.isActive).toBeFalsy();
+});
+
+test("customResourceHandler: not created for a stack without custom resources", async () => {
+  const stack = new Stack(await createApp(), "stack");
+  new Function(stack, "Function", {
+    handler: "test/constructs/lambda.handler",
+  });
+  const template = Template.fromStack(stack);
+  const functions = template.findResources("AWS::Lambda::Function");
+  expect(
+    Object.keys(functions).filter((id) =>
+      id.startsWith("CustomResourceHandler")
+    )
+  ).toEqual([]);
+  expect(
+    Object.keys(template.findResources("AWS::IAM::Role")).filter((id) =>
+      id.startsWith("CustomResourceHandler")
+    )
+  ).toEqual([]);
+});
+
+test("customResourceHandler: created once, with a stable logical id, on first use", async () => {
+  const stack = new Stack(await createApp(), "stack");
+  expect(stack.customResourceHandler).toBe(stack.customResourceHandler);
+  const template = Template.fromStack(stack);
+  expect(Object.keys(template.findResources("AWS::Lambda::Function"))).toEqual([
+    "CustomResourceHandlerE8FB56BA",
+  ]);
 });

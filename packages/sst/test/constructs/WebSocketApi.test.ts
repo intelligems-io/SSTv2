@@ -816,7 +816,7 @@ test("routes: route is Function", async () => {
       $connect: f,
     },
   });
-  countResources(stack, "AWS::Lambda::Function", 1);
+  countResources(stack, "AWS::Lambda::Function", 2); // includes the stack custom resource handler
   hasResource(stack, "AWS::Lambda::Function", {
     Handler: "index.placeholder",
   });
