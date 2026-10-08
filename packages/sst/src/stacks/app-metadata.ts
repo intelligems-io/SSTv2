@@ -1,5 +1,5 @@
 import { useBootstrap } from "../bootstrap.js";
-import { useAWSCredentials } from "../credentials.js";
+import { useAWSClient } from "../credentials.js";
 import {
   S3Client,
   GetObjectCommand,
@@ -16,15 +16,8 @@ interface Metadata {
 
 async function metadata() {
   Logger.debug("Fetching app metadata");
-  const [project, credentials, bootstrap] = await Promise.all([
-    useProject(),
-    useAWSCredentials(),
-    useBootstrap(),
-  ]);
-  const s3 = new S3Client({
-    region: project.config.region,
-    credentials,
-  });
+  const bootstrap = await useBootstrap();
+  const s3 = useAWSClient(S3Client);
 
   try {
     const result = await s3.send(
@@ -42,15 +35,8 @@ async function metadata() {
 
 export async function saveAppMetadata(data: Metadata) {
   Logger.debug("Saving app metadata");
-  const [project, credentials, bootstrap] = await Promise.all([
-    useProject(),
-    useAWSCredentials(),
-    useBootstrap(),
-  ]);
-  const s3 = new S3Client({
-    region: project.config.region,
-    credentials,
-  });
+  const bootstrap = await useBootstrap();
+  const s3 = useAWSClient(S3Client);
 
   try {
     await s3.send(
@@ -67,15 +53,8 @@ export async function saveAppMetadata(data: Metadata) {
 
 export async function clearAppMetadata() {
   Logger.debug("Clearing app metadata");
-  const [project, credentials, bootstrap] = await Promise.all([
-    useProject(),
-    useAWSCredentials(),
-    useBootstrap(),
-  ]);
-  const s3 = new S3Client({
-    region: project.config.region,
-    credentials,
-  });
+  const bootstrap = await useBootstrap();
+  const s3 = useAWSClient(S3Client);
 
   await s3.send(
     new DeleteObjectCommand({

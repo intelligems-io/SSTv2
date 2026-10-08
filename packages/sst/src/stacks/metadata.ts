@@ -1,8 +1,5 @@
 import { useBootstrap } from "../bootstrap.js";
-import {
-  useAWSCredentials,
-  useAWSCredentialsProvider,
-} from "../credentials.js";
+import { useAWSClient } from "../credentials.js";
 import {
   S3Client,
   GetObjectCommand,
@@ -25,14 +22,8 @@ declare module "../bus.js" {
 
 export async function metadataForStack(stack: String) {
   const project = useProject();
-  const [credentials, bootstrap] = await Promise.all([
-    useAWSCredentials(),
-    useBootstrap(),
-  ]);
-  const s3 = new S3Client({
-    region: project.config.region,
-    credentials: credentials,
-  });
+  const bootstrap = await useBootstrap();
+  const s3 = useAWSClient(S3Client);
 
   try {
     const result = await s3.send(
@@ -52,14 +43,8 @@ export async function metadataForStack(stack: String) {
 export async function metadata() {
   Logger.debug("Fetching all metadata");
   const project = useProject();
-  const [credentials, bootstrap] = await Promise.all([
-    useAWSCredentials(),
-    useBootstrap(),
-  ]);
-  const s3 = new S3Client({
-    region: project.config.region,
-    credentials: credentials,
-  });
+  const bootstrap = await useBootstrap();
+  const s3 = useAWSClient(S3Client);
 
   const key = `stackMetadata/app.${project.config.name}/stage.${project.config.stage}/`;
   const list = await s3.send(
