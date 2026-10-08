@@ -4,6 +4,7 @@ import type { AwsCredentialIdentityProvider } from "@aws-sdk/types";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
 import { Logger } from "./logger.js";
+import { awsRetryReason } from "./aws-retry.js";
 import { StandardRetryStrategy } from "@aws-sdk/middleware-retry";
 export type {} from "@smithy/types";
 // @ts-expect-error
@@ -104,28 +105,10 @@ export function useAWSClient<C extends any>(
     credentials: credentials,
     retryStrategy: new StandardRetryStrategy(async () => 10000, {
       retryDecider: (e: any) => {
-        // Handle no internet connection => retry
-        if (e.code === "ENOTFOUND") {
-          printNoInternet(e.message);
-          return true;
-        }
-
-        // Handle throttling errors => retry
-        if (
-          [
-            "ThrottlingException",
-            "Throttling",
-            "TooManyRequestsException",
-            "OperationAbortedException",
-            "TimeoutError",
-            "NetworkingError",
-          ].includes(e.name)
-        ) {
-          Logger.debug("Retry AWS call", e.name, e.message);
-          return true;
-        }
-
-        return false;
+        const reason = awsRetryReason(e);
+        if (reason === "offline") printNoInternet(e.message);
+        else if (reason) Logger.debug("Retry AWS call", reason, e.name, e.message);
+        return reason !== undefined;
       },
       delayDecider: (_, attempts) => {
         return Math.min(1.5 ** attempts * 100, 5000);
